@@ -9,6 +9,7 @@ pub enum DataKey {
     TotalDeposited,
     ShareBalance(Address),
     Paused,
+    WithdrawalLimit,
 }
 
 #[contracttype]

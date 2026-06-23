@@ -1,8 +1,8 @@
 #![cfg(test)]
 
 use soroban_sdk::{
-    testutils::{Address as _, AuthorizedFunction, AuthorizedInvocation},
-    token, Address, Env, IntoVal,
+    testutils::{Address as _, Events},
+    token, Address, Env, IntoVal, Symbol,
 };
 
 use crate::{errors::VaultError, vault::VaultContract, vault::VaultContractClient};
@@ -96,6 +96,13 @@ fn test_deposit_zero_fails() {
 }
 
 #[test]
+fn test_deposit_negative_fails() {
+    let f = VaultFixture::new();
+    let result = f.vault.try_deposit(&f.alice, &-100);
+    assert_eq!(result, Err(Ok(VaultError::ZeroAmount)));
+}
+
+#[test]
 fn test_two_depositors_get_proportional_shares() {
     let f = VaultFixture::new();
 
@@ -131,6 +138,15 @@ fn test_withdraw_more_than_owned_fails() {
 
     let result = f.vault.try_withdraw(&f.alice, &200_000);
     assert_eq!(result, Err(Ok(VaultError::InsufficientShares)));
+}
+
+#[test]
+fn test_withdraw_zero_fails() {
+    let f = VaultFixture::new();
+    f.vault.deposit(&f.alice, &100_000);
+
+    let result = f.vault.try_withdraw(&f.alice, &0);
+    assert_eq!(result, Err(Ok(VaultError::ZeroAmount)));
 }
 
 #[test]
@@ -244,4 +260,299 @@ fn test_add_yield_paused_blocks() {
 
     let result = f.vault.try_add_yield(&f.admin, &50_000);
     assert_eq!(result, Err(Ok(VaultError::VaultPaused)));
+}
+
+#[test]
+fn test_add_yield_zero_fails() {
+    let f = VaultFixture::new();
+    f.token_admin.mint(&f.admin, &10_000);
+
+    let result = f.vault.try_add_yield(&f.admin, &0);
+    assert_eq!(result, Err(Ok(VaultError::ZeroAmount)));
+}
+
+// ── withdrawal limit (Issue #8) ──────────────────────────────────────────────
+
+#[test]
+fn test_set_withdrawal_limit() {
+    let f = VaultFixture::new();
+    f.vault.set_withdrawal_limit(&100_000);
+    assert_eq!(f.vault.get_withdrawal_limit(), 100_000);
+}
+
+#[test]
+fn test_withdrawal_limit_blocks_large_withdrawal() {
+    let f = VaultFixture::new();
+    f.vault.deposit(&f.alice, &500_000);
+    f.vault.set_withdrawal_limit(&100_000);
+
+    let result = f.vault.try_withdraw(&f.alice, &200_000);
+    assert_eq!(result, Err(Ok(VaultError::WithdrawalLimitExceeded)));
+}
+
+#[test]
+fn test_withdrawal_limit_allows_within_limit() {
+    let f = VaultFixture::new();
+    f.vault.deposit(&f.alice, &500_000);
+    f.vault.set_withdrawal_limit(&100_000);
+
+    let amount = f.vault.withdraw(&f.alice, &100_000);
+    assert_eq!(amount, 100_000);
+    assert_eq!(f.vault.shares_of(&f.alice), 400_000);
+}
+
+#[test]
+fn test_withdrawal_limit_exact_boundary() {
+    let f = VaultFixture::new();
+    f.vault.deposit(&f.alice, &500_000);
+    f.vault.set_withdrawal_limit(&100_000);
+
+    // Exactly at limit should work
+    let amount = f.vault.withdraw(&f.alice, &100_000);
+    assert_eq!(amount, 100_000);
+}
+
+#[test]
+fn test_withdrawal_limit_one_over_fails() {
+    let f = VaultFixture::new();
+    f.vault.deposit(&f.alice, &500_000);
+    f.vault.set_withdrawal_limit(&100_000);
+
+    // One over limit should fail
+    let result = f.vault.try_withdraw(&f.alice, &100_001);
+    assert_eq!(result, Err(Ok(VaultError::WithdrawalLimitExceeded)));
+}
+
+#[test]
+fn test_admin_updates_withdrawal_limit() {
+    let f = VaultFixture::new();
+    f.vault.deposit(&f.alice, &500_000);
+
+    // Set initial limit
+    f.vault.set_withdrawal_limit(&50_000);
+    assert_eq!(f.vault.get_withdrawal_limit(), 50_000);
+
+    // 60k fails with old limit
+    let result = f.vault.try_withdraw(&f.alice, &60_000);
+    assert_eq!(result, Err(Ok(VaultError::WithdrawalLimitExceeded)));
+
+    // Admin raises limit
+    f.vault.set_withdrawal_limit(&100_000);
+    assert_eq!(f.vault.get_withdrawal_limit(), 100_000);
+
+    // 60k now passes
+    let amount = f.vault.withdraw(&f.alice, &60_000);
+    assert_eq!(amount, 60_000);
+}
+
+#[test]
+fn test_set_withdrawal_limit_zero_fails() {
+    let f = VaultFixture::new();
+    let result = f.vault.try_set_withdrawal_limit(&0);
+    assert_eq!(result, Err(Ok(VaultError::ZeroAmount)));
+}
+
+#[test]
+fn test_set_withdrawal_limit_negative_fails() {
+    let f = VaultFixture::new();
+    let result = f.vault.try_set_withdrawal_limit(&-100);
+    assert_eq!(result, Err(Ok(VaultError::ZeroAmount)));
+}
+
+#[test]
+fn test_set_withdrawal_limit_unauthorized_fails() {
+    let f = VaultFixture::new();
+    let result = f.vault.try_set_withdrawal_limit_as(&f.alice, &100_000);
+    assert_eq!(result, Err(Ok(VaultError::Unauthorized)));
+}
+
+#[test]
+fn test_no_withdrawal_limit_by_default() {
+    let f = VaultFixture::new();
+    f.vault.deposit(&f.alice, &500_000);
+
+    // No limit set, should be 0 (no restriction)
+    assert_eq!(f.vault.get_withdrawal_limit(), 0);
+
+    // Should be able to withdraw everything
+    let amount = f.vault.withdraw(&f.alice, &500_000);
+    assert_eq!(amount, 500_000);
+}
+
+// ── event emission (Issue #7) ─────────────────────────────────────────────────
+
+#[test]
+fn test_deposit_emits_event() {
+    let f = VaultFixture::new();
+
+    f.vault.deposit(&f.alice, &100_000);
+
+    let events = f.env.events().all();
+    let deposit_events: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.topics.first() == Some(&Symbol::new(&f.env, "deposit"))
+        })
+        .collect();
+
+    assert_eq!(deposit_events.len(), 1);
+    let event = &deposit_events[0];
+    assert_eq!(event.topics.get(1), Some(f.alice.clone().into_val(&f.env)));
+}
+
+#[test]
+fn test_withdraw_emits_event() {
+    let f = VaultFixture::new();
+    f.vault.deposit(&f.alice, &100_000);
+
+    f.vault.withdraw(&f.alice, &50_000);
+
+    let events = f.env.events().all();
+    let withdraw_events: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.topics.first() == Some(&Symbol::new(&f.env, "withdraw"))
+        })
+        .collect();
+
+    assert_eq!(withdraw_events.len(), 1);
+    let event = &withdraw_events[0];
+    assert_eq!(event.topics.get(1), Some(f.alice.clone().into_val(&f.env)));
+}
+
+#[test]
+fn test_pause_emits_event() {
+    let f = VaultFixture::new();
+
+    f.vault.pause();
+
+    let events = f.env.events().all();
+    let paused_events: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.topics.first() == Some(&Symbol::new(&f.env, "paused"))
+        })
+        .collect();
+
+    assert_eq!(paused_events.len(), 1);
+}
+
+#[test]
+fn test_unpause_emits_event() {
+    let f = VaultFixture::new();
+    f.vault.pause();
+
+    f.vault.unpause();
+
+    let events = f.env.events().all();
+    let unpaused_events: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.topics.first() == Some(&Symbol::new(&f.env, "unpaused"))
+        })
+        .collect();
+
+    assert_eq!(unpaused_events.len(), 1);
+}
+
+#[test]
+fn test_transfer_admin_emits_event() {
+    let f = VaultFixture::new();
+
+    f.vault.transfer_admin(&f.bob);
+
+    let events = f.env.events().all();
+    let admin_events: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.topics.first() == Some(&Symbol::new(&f.env, "admin_set"))
+        })
+        .collect();
+
+    assert_eq!(admin_events.len(), 1);
+    let event = &admin_events[0];
+    assert_eq!(event.topics.get(1), Some(f.admin.clone().into_val(&f.env)));
+}
+
+#[test]
+fn test_withdrawal_limit_update_emits_event() {
+    let f = VaultFixture::new();
+
+    f.vault.set_withdrawal_limit(&100_000);
+
+    let events = f.env.events().all();
+    let limit_events: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.topics.first() == Some(&Symbol::new(&f.env, "wd_limit"))
+        })
+        .collect();
+
+    assert_eq!(limit_events.len(), 1);
+}
+
+#[test]
+fn test_yield_added_emits_event() {
+    let f = VaultFixture::new();
+    f.token_admin.mint(&f.admin, &50_000);
+
+    f.vault.add_yield(&f.admin, &50_000);
+
+    let events = f.env.events().all();
+    let yield_events: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.topics.first() == Some(&Symbol::new(&f.env, "yield_add"))
+        })
+        .collect();
+
+    assert_eq!(yield_events.len(), 1);
+}
+
+// ── error handling edge cases (Issue #9) ─────────────────────────────────────
+
+#[test]
+fn test_deposit_negative_amount_fails() {
+    let f = VaultFixture::new();
+    let result = f.vault.try_deposit(&f.alice, &-500);
+    assert_eq!(result, Err(Ok(VaultError::ZeroAmount)));
+}
+
+#[test]
+fn test_withdraw_negative_shares_fails() {
+    let f = VaultFixture::new();
+    f.vault.deposit(&f.alice, &100_000);
+
+    let result = f.vault.try_withdraw(&f.alice, &-500);
+    assert_eq!(result, Err(Ok(VaultError::ZeroAmount)));
+}
+
+#[test]
+fn test_transfer_admin_unauthorized_fails() {
+    let f = VaultFixture::new();
+    let result = f.vault.try_transfer_admin_as(&f.alice, &f.bob);
+    assert_eq!(result, Err(Ok(VaultError::Unauthorized)));
+}
+
+#[test]
+fn test_pause_unauthorized_fails() {
+    let f = VaultFixture::new();
+    let result = f.vault.try_pause_as(&f.alice);
+    assert_eq!(result, Err(Ok(VaultError::Unauthorized)));
+}
+
+#[test]
+fn test_unpause_unauthorized_fails() {
+    let f = VaultFixture::new();
+    let result = f.vault.try_unpause_as(&f.alice);
+    assert_eq!(result, Err(Ok(VaultError::Unauthorized)));
+}
+
+#[test]
+fn test_get_withdrawal_limit_before_init_fails() {
+    let env = Env::default();
+    let vault_id = env.register(VaultContract, ());
+    let vault = VaultContractClient::new(&env, &vault_id);
+    let result = vault.try_get_withdrawal_limit();
+    assert_eq!(result, Err(Ok(VaultError::NotInitialized)));
 }

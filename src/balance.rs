@@ -38,6 +38,18 @@ pub fn set_total_deposited(env: &Env, total: i128) {
         .set(&DataKey::TotalDeposited, &total);
 }
 
+pub fn get_withdrawal_limit(env: &Env) -> Option<i128> {
+    env.storage()
+        .instance()
+        .get(&DataKey::WithdrawalLimit)
+}
+
+pub fn set_withdrawal_limit(env: &Env, limit: i128) {
+    env.storage()
+        .instance()
+        .set(&DataKey::WithdrawalLimit, &limit);
+}
+
 /// Convert a deposit amount to shares using current vault ratio.
 /// First deposit: 1:1. Subsequent: proportional to existing pool.
 pub fn amount_to_shares(total_shares: i128, total_deposited: i128, amount: i128) -> Option<i128> {

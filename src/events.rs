@@ -1,4 +1,4 @@
-use soroban_sdk::{Address, Env, Symbol, symbol_short};
+use soroban_sdk::{Address, Env, symbol_short};
 
 pub fn deposit(env: &Env, depositor: &Address, amount: i128, shares_minted: i128) {
     let topics = (symbol_short!("deposit"), depositor);
@@ -23,4 +23,14 @@ pub fn unpaused(env: &Env, admin: &Address) {
 pub fn yield_added(env: &Env, admin: &Address, amount: i128) {
     let topics = (symbol_short!("yield_add"), admin);
     env.events().publish(topics, (amount,));
+}
+
+pub fn admin_changed(env: &Env, old_admin: &Address, new_admin: &Address) {
+    let topics = (symbol_short!("admin_set"), old_admin);
+    env.events().publish(topics, (new_admin,));
+}
+
+pub fn withdrawal_limit_updated(env: &Env, admin: &Address, new_limit: i128) {
+    let topics = (symbol_short!("wd_limit"), admin);
+    env.events().publish(topics, (new_limit,));
 }

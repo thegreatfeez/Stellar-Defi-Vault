@@ -69,6 +69,7 @@ cargo clippy --features testutils -- -D warnings
 | `vault_state()` | — | Query pool totals |
 | `pause()` | admin | Emergency pause |
 | `unpause()` | admin | Resume operations |
+| `add_yield(admin_addr, amount)` | admin | Inject yield; raises share price |
 | `transfer_admin(new_admin)` | admin | Rotate admin key |
 
 ## Events
@@ -79,6 +80,7 @@ cargo clippy --features testutils -- -D warnings
 | `withdraw` | `(withdrawer, shares_burned, amount_returned)` |
 | `paused` | `(admin)` |
 | `unpaused` | `(admin)` |
+| `yield_add` | `(admin, amount)` |
 
 ## Roadmap / Open Issues
 
@@ -99,7 +101,14 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) for setup instructions and the Wave con
 
 ## Security
 
-This contract is unaudited. Do not use in production without a security audit. If you find a vulnerability, please open a private GitHub Security Advisory rather than a public issue.
+See [docs/SECURITY.md](./docs/SECURITY.md) for the full security model, including:
+
+- Complete list of admin-only functions and their effects
+- What the admin can and cannot do (the admin **cannot** access user principal)
+- Failure scenarios: paused vault, halted yield, key compromise
+- Admin key rotation procedure via `transfer_admin`
+
+This contract is unaudited. Do not use in production without an independent security audit. If you find a vulnerability, please open a private [GitHub Security Advisory](../../security/advisories/new) rather than a public issue.
 
 ## License
 

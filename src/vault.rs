@@ -128,7 +128,19 @@ impl VaultContract {
         ))
     }
 
-    /// Admin: pause deposits and withdrawals.
+    /// Pause all deposits and withdrawals (admin only).
+    ///
+    /// Sets the `Paused` flag to `true`. Any subsequent call to `deposit` or
+    /// `withdraw` will return `VaultError::VaultPaused` and make no state
+    /// changes until `unpause` is called. `add_yield` is also blocked while
+    /// paused. User share balances and the vault's token holdings are
+    /// unaffected by this call.
+    ///
+    /// Emits a `paused` event containing the admin address.
+    ///
+    /// # Errors
+    /// - `VaultError::NotInitialized` — contract has not been initialized.
+    /// - `VaultError::Unauthorized` — caller is not the current admin.
     pub fn pause(env: Env) -> Result<(), VaultError> {
         admin::require_admin(&env)?;
         env.storage().instance().set(&DataKey::Paused, &true);
@@ -137,7 +149,16 @@ impl VaultContract {
         Ok(())
     }
 
-    /// Admin: unpause.
+    /// Resume deposits and withdrawals after a pause (admin only).
+    ///
+    /// Sets the `Paused` flag to `false`. Normal vault operations resume
+    /// immediately; no funds are moved by this call itself.
+    ///
+    /// Emits an `unpaused` event containing the admin address.
+    ///
+    /// # Errors
+    /// - `VaultError::NotInitialized` — contract has not been initialized.
+    /// - `VaultError::Unauthorized` — caller is not the current admin.
     pub fn unpause(env: Env) -> Result<(), VaultError> {
         admin::require_admin(&env)?;
         env.storage().instance().set(&DataKey::Paused, &false);
@@ -146,9 +167,26 @@ impl VaultContract {
         Ok(())
     }
 
-    /// Admin: add yield to the vault by transferring `amount` tokens from the admin
-    /// into the vault. This increases `total_deposited` without minting new shares,
-    /// which raises the share price for existing shareholders.
+    /// Inject yield into the vault by transferring tokens from the admin wallet (admin only).
+    ///
+    /// Transfers `amount` tokens from `admin_addr` into the vault contract and
+    /// increments `total_deposited` by the same amount **without** minting new
+    /// shares. Because existing shares now represent a larger pool, the share
+    /// price rises proportionally for all current holders.
+    ///
+    /// The admin must hold at least `amount` tokens and must authorize the
+    /// transfer. This function cannot remove or redirect tokens that belong to
+    /// depositors — it only moves tokens *into* the vault.
+    ///
+    /// Requires the vault to be unpaused.
+    ///
+    /// Emits a `yield_add` event containing the admin address and amount.
+    ///
+    /// # Errors
+    /// - `VaultError::NotInitialized` — contract has not been initialized.
+    /// - `VaultError::Unauthorized` — caller is not the current admin.
+    /// - `VaultError::VaultPaused` — vault is currently paused.
+    /// - `VaultError::ZeroAmount` — `amount` is zero or negative.
     pub fn add_yield(env: Env, admin_addr: Address, amount: i128) -> Result<(), VaultError> {
         // ensure caller is admin
         admin::require_admin(&env)?;
@@ -179,7 +217,16 @@ impl VaultContract {
         Ok(())
     }
 
-    /// Admin: transfer admin role to a new address.
+    /// Transfer the admin role to a new address (admin only).
+    ///
+    /// Atomically replaces the stored admin address with `new_admin`. The
+    /// current admin loses all privileges the moment this transaction is
+    /// confirmed; `new_admin` gains them immediately. There is no two-phase
+    /// handoff — verify `new_admin` is accessible before calling.
+    ///
+    /// # Errors
+    /// - `VaultError::NotInitialized` — contract has not been initialized.
+    /// - `VaultError::Unauthorized` — caller is not the current admin.
     pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), VaultError> {
         admin::require_admin(&env)?;
         let old_admin = admin::get_admin(&env)?;

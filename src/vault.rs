@@ -140,6 +140,39 @@ impl VaultContract {
         Ok(())
     }
 
+    /// Admin: add yield to the vault by transferring `amount` tokens from the admin
+    /// into the vault. This increases `total_deposited` without minting new shares,
+    /// which raises the share price for existing shareholders.
+    pub fn add_yield(env: Env, admin_addr: Address, amount: i128) -> Result<(), VaultError> {
+        // ensure caller is admin
+        admin::require_admin(&env)?;
+        Self::require_not_paused(&env)?;
+
+        if amount <= 0 {
+            return Err(VaultError::ZeroAmount);
+        }
+
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(VaultError::NotInitialized)?;
+
+        // Transfer tokens from admin into the vault contract
+        let token_client = token::Client::new(&env, &token_addr);
+        token_client.transfer(&admin_addr, &env.current_contract_address(), &amount);
+
+        // Increase total deposited, do NOT mint shares
+        let total_deposited = balance::get_total_deposited(&env);
+        balance::set_total_deposited(&env, total_deposited + amount);
+
+        // Emit event
+        let admin_actual = admin::get_admin(&env)?;
+        events::yield_added(&env, &admin_actual, amount);
+
+        Ok(())
+    }
+
     /// Admin: transfer admin role to a new address.
     pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), VaultError> {
         admin::require_admin(&env)?;

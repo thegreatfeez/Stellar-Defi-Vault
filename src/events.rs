@@ -19,3 +19,8 @@ pub fn unpaused(env: &Env, admin: &Address) {
     let topics = (symbol_short!("unpaused"), admin);
     env.events().publish(topics, ());
 }
+
+pub fn yield_added(env: &Env, admin: &Address, amount: i128) {
+    let topics = (symbol_short!("yield_add"), admin);
+    env.events().publish(topics, (amount,));
+}

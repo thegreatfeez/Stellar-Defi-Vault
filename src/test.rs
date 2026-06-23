@@ -198,3 +198,50 @@ fn test_transfer_admin() {
     // Bob is now admin — he should be able to pause
     f.vault.pause();
 }
+
+// ── yield accrual ────────────────────────────────────────────────────────────
+
+#[test]
+fn test_add_yield_increases_share_price() {
+    let f = VaultFixture::new();
+
+    // Alice deposits 500k -> 500k shares
+    f.vault.deposit(&f.alice, &500_000);
+
+    // Mint tokens to admin so they can add yield
+    f.token_admin.mint(&f.admin, &100_000);
+
+    // Preview before yield: 250k shares -> 250k tokens
+    let preview_before = f.vault.preview_redeem(&250_000);
+    assert_eq!(preview_before, 250_000);
+
+    // Admin adds 100k yield
+    f.vault.add_yield(&f.admin, &100_000);
+
+    // Vault total_deposited should increase
+    let (_total_shares, total_deposited) = f.vault.vault_state();
+    assert_eq!(total_deposited, 600_000);
+
+    // Preview after yield: 250k shares -> 300k tokens
+    let preview_after = f.vault.preview_redeem(&250_000);
+    assert_eq!(preview_after, 300_000);
+}
+
+#[test]
+fn test_add_yield_unauthorized_fails() {
+    let f = VaultFixture::new();
+    f.token_admin.mint(&f.admin, &10_000);
+
+    let result = f.vault.try_add_yield(&f.alice, &10_000);
+    assert_eq!(result, Err(Ok(VaultError::Unauthorized)));
+}
+
+#[test]
+fn test_add_yield_paused_blocks() {
+    let f = VaultFixture::new();
+    f.token_admin.mint(&f.admin, &50_000);
+    f.vault.pause();
+
+    let result = f.vault.try_add_yield(&f.admin, &50_000);
+    assert_eq!(result, Err(Ok(VaultError::VaultPaused)));
+}

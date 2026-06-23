@@ -69,6 +69,12 @@ impl VaultContract {
             return Err(VaultError::ZeroAmount);
         }
 
+        if let Some(limit) = balance::get_withdrawal_limit(&env) {
+            if shares > limit {
+                return Err(VaultError::WithdrawalLimitExceeded);
+            }
+        }
+
         let user_shares = balance::get_shares(&env, &withdrawer);
         if user_shares < shares {
             return Err(VaultError::InsufficientShares);
@@ -176,8 +182,28 @@ impl VaultContract {
     /// Admin: transfer admin role to a new address.
     pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), VaultError> {
         admin::require_admin(&env)?;
+        let old_admin = admin::get_admin(&env)?;
         admin::set_admin(&env, &new_admin);
+        events::admin_changed(&env, &old_admin, &new_admin);
         Ok(())
+    }
+
+    /// Admin: set the maximum withdrawal limit per transaction (in shares).
+    pub fn set_withdrawal_limit(env: Env, limit: i128) -> Result<(), VaultError> {
+        admin::require_admin(&env)?;
+        if limit <= 0 {
+            return Err(VaultError::ZeroAmount);
+        }
+        balance::set_withdrawal_limit(&env, limit);
+        let admin = admin::get_admin(&env)?;
+        events::withdrawal_limit_updated(&env, &admin, limit);
+        Ok(())
+    }
+
+    /// Query the current withdrawal limit per transaction.
+    pub fn get_withdrawal_limit(env: Env) -> Result<i128, VaultError> {
+        let _ = admin::get_admin(&env)?; // ensures initialized
+        Ok(balance::get_withdrawal_limit(&env).unwrap_or(0))
     }
 
     // --- Internal helpers ---

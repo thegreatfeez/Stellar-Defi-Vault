@@ -18,4 +18,5 @@ pub enum VaultError {
     TooManyBoostTiers = 12,
     InvalidBoostSchedule = 13,
     InsufficientRewardPool = 14,
+    NotADelegate = 15,
 }

@@ -1,6 +1,9 @@
 use soroban_sdk::{contract, contractimpl, token, Address, Env, Vec};
 
-use crate::{admin, balance, errors::VaultError, events, storage::DataKey};
+use crate::{
+    admin, balance, errors::VaultError, events,
+    storage::{DataKey, PoolStats, UserStats},
+};
 
 pub(crate) const BOOST_BPS_BASE: u32 = 10_000;
 pub(crate) const MAX_BOOST_TIERS: u32 = 5;
@@ -73,6 +76,9 @@ impl VaultContract {
         balance::set_reward_pool_balance(&env, reward_pool - reward);
         balance::set_accrued_reward(&env, &staker, 0);
         balance::set_last_claim_ledger(&env, &staker, env.ledger().sequence());
+
+        let paid = balance::get_total_rewards_paid(&env);
+        balance::set_total_rewards_paid(&env, paid + reward);
 
         Ok(reward)
     }
@@ -267,7 +273,9 @@ impl VaultContract {
     /// Admin: set the base reward APR in basis points.
     pub fn set_reward_rate_bps(env: Env, rate_bps: u32) -> Result<(), VaultError> {
         admin::require_admin(&env)?;
+        let old_rate = balance::get_reward_rate_bps(&env);
         balance::set_reward_rate_bps(&env, rate_bps);
+        events::rate_changed(&env, old_rate, rate_bps);
         Ok(())
     }
 
@@ -346,6 +354,146 @@ impl VaultContract {
         ))
     }
 
+    // --- Pool statistics (#38) ---
+
+    /// Aggregate pool statistics for frontend dashboards.
+    pub fn pool_stats(env: Env) -> Result<PoolStats, VaultError> {
+        let _ = admin::get_admin(&env)?;
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(VaultError::NotInitialized)?;
+        let token_client = token::Client::new(&env, &token_addr);
+        let reward_token_balance = token_client.balance(&env.current_contract_address());
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+        Ok(PoolStats {
+            total_staked: balance::get_total_deposited(&env),
+            total_stakers: balance::get_total_stakers(&env),
+            reward_rate_bps: balance::get_reward_rate_bps(&env) as i128,
+            reward_token_balance,
+            paused,
+            total_rewards_paid: balance::get_total_rewards_paid(&env),
+        })
+    }
+
+    /// Per-user statistics: position size, pending reward, stake age, last claim ledger.
+    pub fn user_stats(env: Env, user: Address) -> Result<UserStats, VaultError> {
+        let _ = admin::get_admin(&env)?;
+        let total_shares = balance::get_total_shares(&env);
+        let total_deposited = balance::get_total_deposited(&env);
+        let shares = balance::get_shares(&env, &user);
+        let position_amount = if shares > 0 {
+            balance::shares_to_amount(total_shares, total_deposited, shares)
+                .ok_or(VaultError::ArithmeticError)?
+        } else {
+            0
+        };
+        let pending_reward = Self::pending_reward(&env, &user)?;
+        let staked_at_ledger = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::StakedAtLedger(user.clone()))
+            .unwrap_or(0);
+        let last_claim_ledger = balance::get_last_claim_ledger(&env, &user);
+        Ok(UserStats {
+            position_amount,
+            pending_reward,
+            staked_at_ledger,
+            last_claim_ledger,
+        })
+    }
+
+    // --- Delegated staking (#37) ---
+
+    /// Grant `delegate` permission to stake on behalf of `user`.
+    pub fn approve_delegate(env: Env, user: Address, delegate: Address) -> Result<(), VaultError> {
+        user.require_auth();
+        balance::set_delegate(&env, &user, &delegate);
+        Ok(())
+    }
+
+    /// Revoke the current delegate for `user`.
+    pub fn revoke_delegate(env: Env, user: Address, delegate: Address) -> Result<(), VaultError> {
+        user.require_auth();
+        match balance::get_delegate(&env, &user) {
+            Some(d) if d == delegate => balance::remove_delegate(&env, &user),
+            _ => return Err(VaultError::NotADelegate),
+        }
+        Ok(())
+    }
+
+    /// Read-only check: returns true if `delegate` is approved to stake for `user`.
+    pub fn is_delegate(env: Env, user: Address, delegate: Address) -> bool {
+        balance::get_delegate(&env, &user)
+            .map(|d| d == delegate)
+            .unwrap_or(false)
+    }
+
+    /// Stake `amount` tokens from `delegate`'s wallet, crediting the position to `beneficiary`.
+    /// Only an approved delegate may call this; the beneficiary retains exclusive unstake/claim rights.
+    pub fn stake_for(
+        env: Env,
+        delegate: Address,
+        beneficiary: Address,
+        amount: i128,
+    ) -> Result<i128, VaultError> {
+        delegate.require_auth();
+        Self::require_not_paused(&env)?;
+
+        if amount <= 0 {
+            return Err(VaultError::ZeroAmount);
+        }
+
+        match balance::get_delegate(&env, &beneficiary) {
+            Some(d) if d == delegate => {}
+            _ => return Err(VaultError::NotADelegate),
+        }
+
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(VaultError::NotInitialized)?;
+
+        let total_shares = balance::get_total_shares(&env);
+        let total_deposited = balance::get_total_deposited(&env);
+        let current_shares = balance::get_shares(&env, &beneficiary);
+
+        Self::require_min_stake(&env, current_shares, total_shares, total_deposited, amount)?;
+        Self::accrue_rewards(&env, &beneficiary, current_shares)?;
+
+        let shares = balance::amount_to_shares(total_shares, total_deposited, amount)
+            .ok_or(VaultError::ArithmeticError)?;
+
+        let token_client = token::Client::new(&env, &token_addr);
+        token_client.transfer(&delegate, &env.current_contract_address(), &amount);
+
+        let new_shares = current_shares + shares;
+        balance::set_shares(&env, &beneficiary, new_shares);
+        balance::set_total_shares(&env, total_shares + shares);
+        balance::set_total_deposited(&env, total_deposited + amount);
+
+        let current_ledger = env.ledger().sequence();
+        if current_shares == 0 {
+            env.storage()
+                .persistent()
+                .set(&DataKey::StakedAtLedger(beneficiary.clone()), &current_ledger);
+            let total_stakers = balance::get_total_stakers(&env);
+            balance::set_total_stakers(&env, total_stakers + 1);
+            events::position_opened(&env, &beneficiary, amount);
+        }
+        Self::record_stake_snapshot(&env, &beneficiary, new_shares);
+
+        events::deposit(&env, &beneficiary, amount, shares);
+
+        Ok(shares)
+    }
+
     // --- Internal helpers ---
 
     fn do_stake(env: &Env, staker: &Address, amount: i128) -> Result<i128, VaultError> {
@@ -385,6 +533,9 @@ impl VaultContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::StakedAtLedger(staker.clone()), &current_ledger);
+            let total_stakers = balance::get_total_stakers(env);
+            balance::set_total_stakers(env, total_stakers + 1);
+            events::position_opened(env, staker, amount);
         }
         Self::record_stake_snapshot(env, staker, new_shares);
 
@@ -471,6 +622,11 @@ impl VaultContract {
             env.storage()
                 .persistent()
                 .remove(&DataKey::StakedAtLedger(staker.clone()));
+            let total_stakers = balance::get_total_stakers(env);
+            if total_stakers > 0 {
+                balance::set_total_stakers(env, total_stakers - 1);
+            }
+            events::position_closed(env, staker);
         }
         Self::record_stake_snapshot(env, staker, new_user_shares);
 

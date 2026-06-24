@@ -136,6 +136,57 @@ pub fn set_boost_schedule(env: &Env, tiers: &Vec<(u32, u32)>) {
     env.storage().instance().set(&DataKey::BoostSchedule, tiers);
 }
 
+pub fn get_total_stakers(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::TotalStakers)
+        .unwrap_or(0)
+}
+
+pub fn set_total_stakers(env: &Env, count: u32) {
+    env.storage()
+        .instance()
+        .set(&DataKey::TotalStakers, &count);
+}
+
+pub fn get_total_rewards_paid(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::TotalRewardsPaid)
+        .unwrap_or(0)
+}
+
+pub fn set_total_rewards_paid(env: &Env, amount: i128) {
+    env.storage()
+        .instance()
+        .set(&DataKey::TotalRewardsPaid, &amount);
+}
+
+pub fn get_last_claim_ledger(env: &Env, user: &Address) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::LastClaimLedger(user.clone()))
+        .unwrap_or(0)
+}
+
+pub fn get_delegate(env: &Env, user: &Address) -> Option<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Delegate(user.clone()))
+}
+
+pub fn set_delegate(env: &Env, user: &Address, delegate: &Address) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::Delegate(user.clone()), delegate);
+}
+
+pub fn remove_delegate(env: &Env, user: &Address) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::Delegate(user.clone()));
+}
+
 /// Convert a deposit amount to shares using current vault ratio.
 /// First deposit: 1:1. Subsequent: proportional to existing pool.
 pub fn amount_to_shares(total_shares: i128, total_deposited: i128, amount: i128) -> Option<i128> {

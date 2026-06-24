@@ -14,4 +14,8 @@ pub enum VaultError {
     ArithmeticError = 8,
     WithdrawalLimitExceeded = 9,
     InvalidPenaltyBps = 10,
+    BelowMinimumStake = 11,
+    TooManyBoostTiers = 12,
+    InvalidBoostSchedule = 13,
+    InsufficientRewardPool = 14,
 }

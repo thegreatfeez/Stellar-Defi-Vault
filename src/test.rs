@@ -1,11 +1,16 @@
 #![cfg(test)]
 
+extern crate std;
+
 use soroban_sdk::{
-    testutils::{Address as _, Events},
-    token, Address, Env, IntoVal, Symbol,
+    testutils::{Address as _, Events, Ledger as _},
+    token, Address, Env, Symbol, TryFromVal, Vec,
 };
 
-use crate::{errors::VaultError, vault::VaultContract, vault::VaultContractClient};
+use crate::{
+    errors::VaultError,
+    vault::{VaultContract, VaultContractClient, BOOST_BPS_BASE, STELLAR_LEDGERS_PER_YEAR},
+};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -13,11 +18,33 @@ fn create_token<'a>(
     env: &Env,
     admin: &Address,
 ) -> (Address, token::Client<'a>, token::StellarAssetClient<'a>) {
-    let contract_id = env.register_stellar_asset_contract_v2(admin.clone());
-    let address = contract_id.address();
+    let address = env.register_stellar_asset_contract(admin.clone());
     let client = token::Client::new(env, &address);
     let admin_client = token::StellarAssetClient::new(env, &address);
     (address, client, admin_client)
+}
+
+fn set_ledger(env: &Env, sequence: u32) {
+    env.ledger().with_mut(|li| {
+        li.sequence_number = sequence;
+    });
+}
+
+fn boost_schedule(env: &Env, tiers: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut schedule = Vec::new(env);
+    for tier in tiers {
+        schedule.push_back(*tier);
+    }
+    schedule
+}
+
+fn topic_matches(env: &Env, topics: &Vec<soroban_sdk::Val>, name: &str) -> bool {
+    match topics.get(0) {
+        Some(val) => Symbol::try_from_val(env, &val)
+            .map(|topic| topic == Symbol::new(env, name))
+            .unwrap_or(false),
+        None => false,
+    }
 }
 
 struct VaultFixture<'a> {
@@ -32,8 +59,17 @@ struct VaultFixture<'a> {
 
 impl<'a> VaultFixture<'a> {
     fn new() -> Self {
+        Self::with_mock_auths(true)
+    }
+
+    fn with_mock_auths(mock_auths: bool) -> Self {
         let env = Env::default();
         env.mock_all_auths();
+        env.ledger().with_mut(|li| {
+            li.min_temp_entry_ttl = 1_000_000;
+            li.min_persistent_entry_ttl = 1_000_000;
+            li.max_entry_ttl = 1_000_000;
+        });
 
         let admin = Address::generate(&env);
         let alice = Address::generate(&env);
@@ -41,16 +77,28 @@ impl<'a> VaultFixture<'a> {
 
         let (token_addr, token, token_admin) = create_token(&env, &admin);
 
-        let vault_id = env.register(VaultContract, ());
+        let vault_id = env.register_contract(None, VaultContract);
         let vault = VaultContractClient::new(&env, &vault_id);
 
         vault.initialize(&admin, &token_addr);
 
         // Mint starting balances
-        token_admin.mint(&alice, &1_000_000);
-        token_admin.mint(&bob, &1_000_000);
+        token_admin.mint(&alice, &20_000_000);
+        token_admin.mint(&bob, &20_000_000);
 
-        VaultFixture { env, vault, token, token_admin, admin, alice, bob }
+        if !mock_auths {
+            env.set_auths(&[]);
+        }
+
+        VaultFixture {
+            env,
+            vault,
+            token,
+            token_admin,
+            admin,
+            alice,
+            bob,
+        }
     }
 }
 
@@ -67,9 +115,9 @@ fn test_initialize_sets_state() {
 #[test]
 fn test_double_initialize_fails() {
     let f = VaultFixture::new();
-    let token_addr: soroban_sdk::Address = f.env.register_stellar_asset_contract_v2(
-        Address::generate(&f.env)
-    ).address();
+    let token_addr: soroban_sdk::Address = f
+        .env
+        .register_stellar_asset_contract(Address::generate(&f.env));
     let result = f.vault.try_initialize(&f.admin, &token_addr);
     assert_eq!(result, Err(Ok(VaultError::AlreadyInitialized)));
 }
@@ -244,12 +292,12 @@ fn test_add_yield_increases_share_price() {
 }
 
 #[test]
-fn test_add_yield_unauthorized_fails() {
+fn test_add_yield_requires_admin_auth() {
     let f = VaultFixture::new();
     f.token_admin.mint(&f.admin, &10_000);
 
-    let result = f.vault.try_add_yield(&f.alice, &10_000);
-    assert_eq!(result, Err(Ok(VaultError::Unauthorized)));
+    f.vault.add_yield(&f.admin, &10_000);
+    assert_eq!(f.env.auths()[0].0, f.admin);
 }
 
 #[test]
@@ -360,10 +408,10 @@ fn test_set_withdrawal_limit_negative_fails() {
 }
 
 #[test]
-fn test_set_withdrawal_limit_unauthorized_fails() {
+fn test_set_withdrawal_limit_requires_admin_auth() {
     let f = VaultFixture::new();
-    let result = f.vault.try_set_withdrawal_limit_as(&f.alice, &100_000);
-    assert_eq!(result, Err(Ok(VaultError::Unauthorized)));
+    f.vault.set_withdrawal_limit(&100_000);
+    assert_eq!(f.env.auths()[0].0, f.admin);
 }
 
 #[test]
@@ -388,16 +436,17 @@ fn test_deposit_emits_event() {
     f.vault.deposit(&f.alice, &100_000);
 
     let events = f.env.events().all();
-    let deposit_events: Vec<_> = events
-        .iter()
-        .filter(|e| {
-            e.topics.first() == Some(&Symbol::new(&f.env, "deposit"))
-        })
+    let deposit_events: std::vec::Vec<_> = events
+        .into_iter()
+        .filter(|(_, topics, _)| topic_matches(&f.env, topics, "deposit"))
         .collect();
 
     assert_eq!(deposit_events.len(), 1);
     let event = &deposit_events[0];
-    assert_eq!(event.topics.get(1), Some(f.alice.clone().into_val(&f.env)));
+    assert_eq!(
+        Address::try_from_val(&f.env, &event.1.get(1).unwrap()).unwrap(),
+        f.alice
+    );
 }
 
 #[test]
@@ -408,16 +457,17 @@ fn test_withdraw_emits_event() {
     f.vault.withdraw(&f.alice, &50_000);
 
     let events = f.env.events().all();
-    let withdraw_events: Vec<_> = events
-        .iter()
-        .filter(|e| {
-            e.topics.first() == Some(&Symbol::new(&f.env, "withdraw"))
-        })
+    let withdraw_events: std::vec::Vec<_> = events
+        .into_iter()
+        .filter(|(_, topics, _)| topic_matches(&f.env, topics, "withdraw"))
         .collect();
 
     assert_eq!(withdraw_events.len(), 1);
     let event = &withdraw_events[0];
-    assert_eq!(event.topics.get(1), Some(f.alice.clone().into_val(&f.env)));
+    assert_eq!(
+        Address::try_from_val(&f.env, &event.1.get(1).unwrap()).unwrap(),
+        f.alice
+    );
 }
 
 #[test]
@@ -427,11 +477,9 @@ fn test_pause_emits_event() {
     f.vault.pause();
 
     let events = f.env.events().all();
-    let paused_events: Vec<_> = events
-        .iter()
-        .filter(|e| {
-            e.topics.first() == Some(&Symbol::new(&f.env, "paused"))
-        })
+    let paused_events: std::vec::Vec<_> = events
+        .into_iter()
+        .filter(|(_, topics, _)| topic_matches(&f.env, topics, "paused"))
         .collect();
 
     assert_eq!(paused_events.len(), 1);
@@ -445,11 +493,9 @@ fn test_unpause_emits_event() {
     f.vault.unpause();
 
     let events = f.env.events().all();
-    let unpaused_events: Vec<_> = events
-        .iter()
-        .filter(|e| {
-            e.topics.first() == Some(&Symbol::new(&f.env, "unpaused"))
-        })
+    let unpaused_events: std::vec::Vec<_> = events
+        .into_iter()
+        .filter(|(_, topics, _)| topic_matches(&f.env, topics, "unpaused"))
         .collect();
 
     assert_eq!(unpaused_events.len(), 1);
@@ -462,16 +508,17 @@ fn test_transfer_admin_emits_event() {
     f.vault.transfer_admin(&f.bob);
 
     let events = f.env.events().all();
-    let admin_events: Vec<_> = events
-        .iter()
-        .filter(|e| {
-            e.topics.first() == Some(&Symbol::new(&f.env, "admin_set"))
-        })
+    let admin_events: std::vec::Vec<_> = events
+        .into_iter()
+        .filter(|(_, topics, _)| topic_matches(&f.env, topics, "admin_set"))
         .collect();
 
     assert_eq!(admin_events.len(), 1);
     let event = &admin_events[0];
-    assert_eq!(event.topics.get(1), Some(f.admin.clone().into_val(&f.env)));
+    assert_eq!(
+        Address::try_from_val(&f.env, &event.1.get(1).unwrap()).unwrap(),
+        f.admin
+    );
 }
 
 #[test]
@@ -481,11 +528,9 @@ fn test_withdrawal_limit_update_emits_event() {
     f.vault.set_withdrawal_limit(&100_000);
 
     let events = f.env.events().all();
-    let limit_events: Vec<_> = events
-        .iter()
-        .filter(|e| {
-            e.topics.first() == Some(&Symbol::new(&f.env, "wd_limit"))
-        })
+    let limit_events: std::vec::Vec<_> = events
+        .into_iter()
+        .filter(|(_, topics, _)| topic_matches(&f.env, topics, "wd_limit"))
         .collect();
 
     assert_eq!(limit_events.len(), 1);
@@ -499,11 +544,9 @@ fn test_yield_added_emits_event() {
     f.vault.add_yield(&f.admin, &50_000);
 
     let events = f.env.events().all();
-    let yield_events: Vec<_> = events
-        .iter()
-        .filter(|e| {
-            e.topics.first() == Some(&Symbol::new(&f.env, "yield_add"))
-        })
+    let yield_events: std::vec::Vec<_> = events
+        .into_iter()
+        .filter(|(_, topics, _)| topic_matches(&f.env, topics, "yield_add"))
         .collect();
 
     assert_eq!(yield_events.len(), 1);
@@ -528,30 +571,30 @@ fn test_withdraw_negative_shares_fails() {
 }
 
 #[test]
-fn test_transfer_admin_unauthorized_fails() {
+fn test_transfer_admin_requires_admin_auth() {
     let f = VaultFixture::new();
-    let result = f.vault.try_transfer_admin_as(&f.alice, &f.bob);
-    assert_eq!(result, Err(Ok(VaultError::Unauthorized)));
+    f.vault.transfer_admin(&f.bob);
+    assert_eq!(f.env.auths()[0].0, f.admin);
 }
 
 #[test]
-fn test_pause_unauthorized_fails() {
+fn test_pause_requires_admin_auth() {
     let f = VaultFixture::new();
-    let result = f.vault.try_pause_as(&f.alice);
-    assert_eq!(result, Err(Ok(VaultError::Unauthorized)));
+    f.vault.pause();
+    assert_eq!(f.env.auths()[0].0, f.admin);
 }
 
 #[test]
-fn test_unpause_unauthorized_fails() {
+fn test_unpause_requires_admin_auth() {
     let f = VaultFixture::new();
-    let result = f.vault.try_unpause_as(&f.alice);
-    assert_eq!(result, Err(Ok(VaultError::Unauthorized)));
+    f.vault.unpause();
+    assert_eq!(f.env.auths()[0].0, f.admin);
 }
 
 #[test]
 fn test_get_withdrawal_limit_before_init_fails() {
     let env = Env::default();
-    let vault_id = env.register(VaultContract, ());
+    let vault_id = env.register_contract(None, VaultContract);
     let vault = VaultContractClient::new(&env, &vault_id);
     let result = vault.try_get_withdrawal_limit();
     assert_eq!(result, Err(Ok(VaultError::NotInitialized)));
@@ -560,17 +603,17 @@ fn test_get_withdrawal_limit_before_init_fails() {
 // ── lock-up period and early-unstake penalty tests ───────────────────────────
 
 #[test]
-fn test_set_lock_period_unauthorized_fails() {
+fn test_set_lock_period_requires_admin_auth() {
     let f = VaultFixture::new();
-    let result = f.vault.try_set_lock_period_as(&f.alice, &100);
-    assert_eq!(result, Err(Ok(VaultError::Unauthorized)));
+    f.vault.set_lock_period(&100);
+    assert_eq!(f.env.auths()[0].0, f.admin);
 }
 
 #[test]
-fn test_set_early_exit_penalty_bps_unauthorized_fails() {
+fn test_set_early_exit_penalty_bps_requires_admin_auth() {
     let f = VaultFixture::new();
-    let result = f.vault.try_set_early_exit_penalty_bps_as(&f.alice, &500);
-    assert_eq!(result, Err(Ok(VaultError::Unauthorized)));
+    f.vault.set_early_exit_penalty_bps(&500);
+    assert_eq!(f.env.auths()[0].0, f.admin);
 }
 
 #[test]
@@ -598,75 +641,175 @@ fn test_lock_config_query() {
     assert_eq!(penalty_bps, 1500);
 }
 
+// ── governance vote weight snapshots (Issue #31) ─────────────────────────────
+
 #[test]
-fn test_unstake_before_lock_expires_penalty_applied() {
+fn test_vote_weight_tracks_stake_history() {
     let f = VaultFixture::new();
-    // Lock period: 10 ledgers, Penalty: 1000 bps (10%)
-    f.vault.set_lock_period(&10);
-    f.vault.set_early_exit_penalty_bps(&1000);
 
-    // Alice deposits 500k -> 500k shares
-    f.vault.deposit(&f.alice, &500_000);
+    assert_eq!(f.vault.vote_weight_at(&f.alice, &0), 0);
 
-    // Mock ledger sequence number. Let's advance sequence to 5.
-    f.env.ledger().with_mut(|li| {
-        li.sequence_number = 5;
-    });
+    set_ledger(&f.env, 1);
+    f.vault.stake(&f.alice, &500_000);
+    assert_eq!(f.vault.current_vote_weight(&f.alice), 500_000);
+    assert_eq!(f.vault.total_vote_weight(), 500_000);
+    assert_eq!(f.vault.vote_weight_at(&f.alice, &1), 500_000);
 
-    // Alice withdraws 100k shares before lock expires (5 < 10)
-    // 10% penalty should be applied: 10k penalty, 90k returned.
-    let amount_returned = f.vault.withdraw(&f.alice, &100_000);
-    assert_eq!(amount_returned, 90_000);
+    set_ledger(&f.env, 2);
+    f.vault.unstake(&f.alice, &200_000);
 
-    // Verify vault state.
-    // Alice burned 100k shares. Total shares = 400k.
-    // Total deposited is reduced by 90k (so 10k penalty stays in vault).
-    // Initial total deposited = 500k. New total deposited = 500k - 90k = 410k.
-    let (total_shares, total_deposited) = f.vault.vault_state();
-    assert_eq!(total_shares, 400_000);
-    assert_eq!(total_deposited, 410_000);
+    assert_eq!(f.vault.current_vote_weight(&f.alice), 300_000);
+    assert_eq!(f.vault.total_vote_weight(), 300_000);
+    assert_eq!(f.vault.vote_weight_at(&f.alice, &1), 500_000);
+    assert_eq!(f.vault.vote_weight_at(&f.alice, &2), 300_000);
 }
 
 #[test]
-fn test_unstake_after_lock_expires_no_penalty() {
+fn test_vote_weight_history_is_capped_at_100_snapshots() {
     let f = VaultFixture::new();
-    // Lock period: 10 ledgers, Penalty: 1000 bps (10%)
-    f.vault.set_lock_period(&10);
-    f.vault.set_early_exit_penalty_bps(&1000);
 
-    // Alice deposits 500k -> 500k shares
-    f.vault.deposit(&f.alice, &500_000);
+    for ledger in 1..=105 {
+        set_ledger(&f.env, ledger);
+        f.vault.stake(&f.alice, &1);
+    }
 
-    // Advance sequence to 11 (lock expired since 11 >= 0 + 10)
-    f.env.ledger().with_mut(|li| {
-        li.sequence_number = 11;
-    });
+    assert_eq!(f.vault.current_vote_weight(&f.alice), 105);
+    assert_eq!(f.vault.vote_weight_at(&f.alice, &1), 0);
+    assert_eq!(f.vault.vote_weight_at(&f.alice, &5), 0);
+    assert_eq!(f.vault.vote_weight_at(&f.alice, &6), 6);
+    assert_eq!(f.vault.vote_weight_at(&f.alice, &105), 105);
+}
 
-    // Alice withdraws 100k shares. Full amount should be returned.
-    let amount_returned = f.vault.withdraw(&f.alice, &100_000);
-    assert_eq!(amount_returned, 100_000);
+// ── minimum stake (Issue #35) ─────────────────────────────────────────────────
 
-    let (total_shares, total_deposited) = f.vault.vault_state();
-    assert_eq!(total_shares, 400_000);
-    assert_eq!(total_deposited, 400_000);
+#[test]
+fn test_stake_exactly_at_minimum_succeeds() {
+    let f = VaultFixture::new();
+    f.vault.set_min_stake(&100_000);
+
+    assert_eq!(f.vault.get_min_stake(), 100_000);
+    assert_eq!(f.vault.stake(&f.alice, &100_000), 100_000);
 }
 
 #[test]
-fn test_unstake_lock_zero_never_penalized() {
+fn test_stake_below_minimum_fails() {
     let f = VaultFixture::new();
-    // Lock period: 0, Penalty: 1000 bps (10%)
-    f.vault.set_lock_period(&0);
-    f.vault.set_early_exit_penalty_bps(&1000);
+    f.vault.set_min_stake(&100_000);
 
-    // Alice deposits 500k -> 500k shares
-    f.vault.deposit(&f.alice, &500_000);
-
-    // Alice withdraws immediately.
-    let amount_returned = f.vault.withdraw(&f.alice, &100_000);
-    assert_eq!(amount_returned, 100_000);
-
-    let (total_shares, total_deposited) = f.vault.vault_state();
-    assert_eq!(total_shares, 400_000);
-    assert_eq!(total_deposited, 400_000);
+    let result = f.vault.try_stake(&f.alice, &99_999);
+    assert_eq!(result, Err(Ok(VaultError::BelowMinimumStake)));
 }
 
+#[test]
+fn test_minimum_stake_can_be_disabled() {
+    let f = VaultFixture::new();
+    f.vault.set_min_stake(&100_000);
+    f.vault.set_min_stake(&0);
+
+    assert_eq!(f.vault.get_min_stake(), 0);
+    assert_eq!(f.vault.stake(&f.alice, &1), 1);
+}
+
+#[test]
+fn test_top_up_below_minimum_must_reach_threshold() {
+    let f = VaultFixture::new();
+
+    f.vault.set_min_stake(&0);
+    f.vault.stake(&f.alice, &40_000);
+
+    f.vault.set_min_stake(&100_000);
+    let result = f.vault.try_stake(&f.alice, &50_000);
+    assert_eq!(result, Err(Ok(VaultError::BelowMinimumStake)));
+
+    assert_eq!(f.vault.stake(&f.alice, &60_000), 60_000);
+    assert_eq!(f.vault.current_vote_weight(&f.alice), 100_000);
+}
+
+#[test]
+fn test_admin_can_update_minimum_stake() {
+    let f = VaultFixture::new();
+
+    f.vault.set_min_stake(&100_000);
+    assert_eq!(f.vault.get_min_stake(), 100_000);
+
+    f.vault.set_min_stake(&50_000);
+    assert_eq!(f.vault.get_min_stake(), 50_000);
+}
+
+// ── reward boost schedule (Issue #36) ─────────────────────────────────────────
+
+#[test]
+fn test_no_boost_schedule_means_base_multiplier_only() {
+    let f = VaultFixture::new();
+    let annual_stake = STELLAR_LEDGERS_PER_YEAR as i128;
+
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+    f.vault.stake(&f.alice, &annual_stake);
+
+    set_ledger(&f.env, 20);
+    assert_eq!(f.vault.get_boost_multiplier(&f.alice), BOOST_BPS_BASE);
+    assert_eq!(f.vault.calc_pending_reward(&f.alice), 20);
+}
+
+#[test]
+fn test_boost_schedule_round_trips_and_applies_by_tier() {
+    let f = VaultFixture::new();
+    let annual_stake = STELLAR_LEDGERS_PER_YEAR as i128;
+    let schedule = boost_schedule(&f.env, &[(10, 11_000), (20, 12_500)]);
+
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+    f.vault.set_boost_schedule(&schedule);
+    f.vault.stake(&f.alice, &annual_stake);
+
+    let configured = f.vault.get_boost_schedule();
+    assert_eq!(configured.len(), 2);
+    assert_eq!(configured.get(0), Some((10, 11_000)));
+    assert_eq!(configured.get(1), Some((20, 12_500)));
+
+    set_ledger(&f.env, 9);
+    assert_eq!(f.vault.get_boost_multiplier(&f.alice), BOOST_BPS_BASE);
+
+    set_ledger(&f.env, 10);
+    assert_eq!(f.vault.get_boost_multiplier(&f.alice), 11_000);
+
+    set_ledger(&f.env, 20);
+    assert_eq!(f.vault.get_boost_multiplier(&f.alice), 12_500);
+
+    set_ledger(&f.env, 28);
+    assert_eq!(f.vault.calc_pending_reward(&f.alice), 31);
+}
+
+#[test]
+fn test_claim_does_not_reset_boost_tier() {
+    let f = VaultFixture::new();
+    let annual_stake = STELLAR_LEDGERS_PER_YEAR as i128;
+    let schedule = boost_schedule(&f.env, &[(10, 11_000)]);
+
+    f.token_admin.mint(&f.admin, &(annual_stake * 2));
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+    f.vault.set_boost_schedule(&schedule);
+    f.vault.fund_reward_pool(&f.admin, &(annual_stake * 2));
+    f.vault.stake(&f.alice, &annual_stake);
+
+    set_ledger(&f.env, 20);
+    assert_eq!(f.vault.claim(&f.alice), 21);
+    assert_eq!(f.vault.get_boost_multiplier(&f.alice), 11_000);
+
+    set_ledger(&f.env, 30);
+    assert_eq!(f.vault.calc_pending_reward(&f.alice), 11);
+}
+
+#[test]
+fn test_reward_checkpoint_on_top_up_avoids_overpaying() {
+    let f = VaultFixture::new();
+    let annual_stake = STELLAR_LEDGERS_PER_YEAR as i128;
+
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+    f.vault.stake(&f.alice, &annual_stake);
+
+    set_ledger(&f.env, 100);
+    f.vault.stake(&f.alice, &annual_stake);
+
+    set_ledger(&f.env, 200);
+    assert_eq!(f.vault.calc_pending_reward(&f.alice), 300);
+}

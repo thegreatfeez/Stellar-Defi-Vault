@@ -1,4 +1,4 @@
-use soroban_sdk::{Address, Env, symbol_short};
+use soroban_sdk::{symbol_short, Address, Env};
 
 pub fn deposit(env: &Env, depositor: &Address, amount: i128, shares_minted: i128) {
     let topics = (symbol_short!("deposit"), depositor);
@@ -7,7 +7,8 @@ pub fn deposit(env: &Env, depositor: &Address, amount: i128, shares_minted: i128
 
 pub fn withdraw(env: &Env, withdrawer: &Address, shares_burned: i128, amount_returned: i128) {
     let topics = (symbol_short!("withdraw"), withdrawer);
-    env.events().publish(topics, (shares_burned, amount_returned));
+    env.events()
+        .publish(topics, (shares_burned, amount_returned));
 }
 
 pub fn paused(env: &Env, admin: &Address) {

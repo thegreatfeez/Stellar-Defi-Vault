@@ -2,10 +2,10 @@
 
 mod admin;
 mod balance;
-mod storage;
-mod vault;
 mod errors;
 mod events;
+mod storage;
+mod vault;
 
 pub use vault::VaultContract;
 

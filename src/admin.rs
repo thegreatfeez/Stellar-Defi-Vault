@@ -1,6 +1,6 @@
-use soroban_sdk::{Address, Env};
-use crate::storage::DataKey;
 use crate::errors::VaultError;
+use crate::storage::DataKey;
+use soroban_sdk::{Address, Env};
 
 pub fn set_admin(env: &Env, admin: &Address) {
     env.storage().instance().set(&DataKey::Admin, admin);

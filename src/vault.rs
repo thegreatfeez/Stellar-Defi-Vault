@@ -1,12 +1,11 @@
-use soroban_sdk::{contract, contractimpl, Address, Env, token};
+use soroban_sdk::{contract, contractimpl, token, Address, Env, Vec};
 
-use crate::{
-    admin,
-    balance,
-    errors::VaultError,
-    events,
-    storage::DataKey,
-};
+use crate::{admin, balance, errors::VaultError, events, storage::DataKey};
+
+pub(crate) const BOOST_BPS_BASE: u32 = 10_000;
+pub(crate) const MAX_BOOST_TIERS: u32 = 5;
+pub(crate) const MAX_HISTORY_SNAPSHOTS: u32 = 100;
+pub(crate) const STELLAR_LEDGERS_PER_YEAR: u32 = 6_307_200;
 
 #[contract]
 pub struct VaultContract;
@@ -18,6 +17,7 @@ impl VaultContract {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(VaultError::AlreadyInitialized);
         }
+
         admin::set_admin(&env, &admin);
         env.storage().instance().set(&DataKey::Token, &token);
         env.storage().instance().set(&DataKey::Paused, &false);
@@ -26,69 +26,40 @@ impl VaultContract {
 
     /// Deposit `amount` of the vault token. Returns shares minted to caller.
     pub fn deposit(env: Env, depositor: Address, amount: i128) -> Result<i128, VaultError> {
-        depositor.require_auth();
-        Self::require_not_paused(&env)?;
+        Self::do_stake(&env, &depositor, amount)
+    }
 
-        if amount <= 0 {
-            return Err(VaultError::ZeroAmount);
-        }
-
-        let token_addr: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Token)
-            .ok_or(VaultError::NotInitialized)?;
-
-        let total_shares = balance::get_total_shares(&env);
-        let total_deposited = balance::get_total_deposited(&env);
-
-        let shares = balance::amount_to_shares(total_shares, total_deposited, amount)
-            .ok_or(VaultError::ArithmeticError)?;
-
-        // Transfer tokens from depositor to vault
-        let token_client = token::Client::new(&env, &token_addr);
-        token_client.transfer(&depositor, &env.current_contract_address(), &amount);
-
-        // Mint shares
-        let current_shares = balance::get_shares(&env, &depositor);
-        balance::set_shares(&env, &depositor, current_shares + shares);
-        balance::set_total_shares(&env, total_shares + shares);
-        balance::set_total_deposited(&env, total_deposited + amount);
-
-        // Update staked_at_ledger to current ledger sequence
-        let current_ledger = env.ledger().sequence();
-        env.storage().persistent().set(&DataKey::StakedAtLedger(depositor.clone()), &current_ledger);
-
-        events::deposit(&env, &depositor, amount, shares);
-
-        Ok(shares)
+    /// Stake `amount` of the vault token. This is an alias for `deposit`.
+    pub fn stake(env: Env, staker: Address, amount: i128) -> Result<i128, VaultError> {
+        Self::do_stake(&env, &staker, amount)
     }
 
     /// Withdraw by burning `shares`. Returns underlying token amount returned.
     pub fn withdraw(env: Env, withdrawer: Address, shares: i128) -> Result<i128, VaultError> {
-        withdrawer.require_auth();
-        Self::require_not_paused(&env)?;
+        Self::do_unstake(&env, &withdrawer, shares)
+    }
 
-        if shares <= 0 {
-            return Err(VaultError::ZeroAmount);
+    /// Unstake by burning `shares`. This is an alias for `withdraw`.
+    pub fn unstake(env: Env, staker: Address, shares: i128) -> Result<i128, VaultError> {
+        Self::do_unstake(&env, &staker, shares)
+    }
+
+    /// Claim accumulated staking rewards without changing the staked position.
+    pub fn claim(env: Env, staker: Address) -> Result<i128, VaultError> {
+        staker.require_auth();
+        let current_shares = balance::get_shares(&env, &staker);
+        Self::accrue_rewards(&env, &staker, current_shares)?;
+
+        let reward = balance::get_accrued_reward(&env, &staker);
+        if reward == 0 {
+            balance::set_last_claim_ledger(&env, &staker, env.ledger().sequence());
+            return Ok(0);
         }
 
-        if let Some(limit) = balance::get_withdrawal_limit(&env) {
-            if shares > limit {
-                return Err(VaultError::WithdrawalLimitExceeded);
-            }
+        let reward_pool = balance::get_reward_pool_balance(&env);
+        if reward_pool < reward {
+            return Err(VaultError::InsufficientRewardPool);
         }
-
-        let user_shares = balance::get_shares(&env, &withdrawer);
-        if user_shares < shares {
-            return Err(VaultError::InsufficientShares);
-        }
-
-        let total_shares = balance::get_total_shares(&env);
-        let total_deposited = balance::get_total_deposited(&env);
-
-        let amount = balance::shares_to_amount(total_shares, total_deposited, shares)
-            .ok_or(VaultError::ArithmeticError)?;
 
         let token_addr: Address = env
             .storage()
@@ -96,53 +67,55 @@ impl VaultContract {
             .get(&DataKey::Token)
             .ok_or(VaultError::NotInitialized)?;
 
-        // Check lockup & calculate penalty
-        let lock_period = env.storage().instance().get(&DataKey::LockPeriod).unwrap_or(0);
-        let penalty_bps = env.storage().instance().get(&DataKey::EarlyExitPenaltyBps).unwrap_or(0);
-
-        let current_ledger = env.ledger().sequence();
-        let is_locked = if lock_period == 0 {
-            false
-        } else {
-            match env.storage().persistent().get::<_, u32>(&DataKey::StakedAtLedger(withdrawer.clone())) {
-                Some(staked_at) => current_ledger < staked_at.saturating_add(lock_period),
-                None => false,
-            }
-        };
-
-        let amount_returned = if is_locked && penalty_bps > 0 {
-            let penalty = amount
-                .checked_mul(penalty_bps as i128)
-                .ok_or(VaultError::ArithmeticError)?
-                .checked_div(10000)
-                .ok_or(VaultError::ArithmeticError)?;
-            amount - penalty
-        } else {
-            amount
-        };
-
-        // Burn shares
-        balance::set_shares(&env, &withdrawer, user_shares - shares);
-        balance::set_total_shares(&env, total_shares - shares);
-        balance::set_total_deposited(&env, total_deposited - amount_returned);
-
-        // Clean up staked_at_ledger if user has no shares left
-        if user_shares == shares {
-            env.storage().persistent().remove(&DataKey::StakedAtLedger(withdrawer.clone()));
-        }
-
-        // Return tokens
         let token_client = token::Client::new(&env, &token_addr);
-        token_client.transfer(&env.current_contract_address(), &withdrawer, &amount_returned);
+        token_client.transfer(&env.current_contract_address(), &staker, &reward);
 
-        events::withdraw(&env, &withdrawer, shares, amount_returned);
+        balance::set_reward_pool_balance(&env, reward_pool - reward);
+        balance::set_accrued_reward(&env, &staker, 0);
+        balance::set_last_claim_ledger(&env, &staker, env.ledger().sequence());
 
-        Ok(amount_returned)
+        Ok(reward)
     }
 
     /// Query share balance of a user.
     pub fn shares_of(env: Env, user: Address) -> i128 {
         balance::get_shares(&env, &user)
+    }
+
+    /// Read-only governance weight using the user's current staked shares.
+    pub fn current_vote_weight(env: Env, user: Address) -> Result<i128, VaultError> {
+        let _ = admin::get_admin(&env)?;
+        Ok(balance::get_shares(&env, &user))
+    }
+
+    /// Total staked shares across all users.
+    pub fn total_staked(env: Env) -> Result<i128, VaultError> {
+        let _ = admin::get_admin(&env)?;
+        Ok(balance::get_total_shares(&env))
+    }
+
+    /// Pool-wide governance vote weight.
+    pub fn total_vote_weight(env: Env) -> Result<i128, VaultError> {
+        Self::total_staked(env)
+    }
+
+    /// Historical governance vote weight at a specific ledger.
+    pub fn vote_weight_at(env: Env, user: Address, ledger: u32) -> Result<i128, VaultError> {
+        let _ = admin::get_admin(&env)?;
+        let history = balance::get_stake_history(&env, &user).unwrap_or(Vec::new(&env));
+        let mut weight = 0;
+        let mut index = 0;
+
+        while index < history.len() {
+            let (snapshot_ledger, snapshot_amount) = history.get(index).unwrap();
+            if snapshot_ledger > ledger {
+                break;
+            }
+            weight = snapshot_amount;
+            index += 1;
+        }
+
+        Ok(weight)
     }
 
     /// Query how many tokens a given share count is worth right now.
@@ -153,9 +126,15 @@ impl VaultContract {
             .ok_or(VaultError::ArithmeticError)
     }
 
+    /// Read-only query for pending staking rewards.
+    pub fn calc_pending_reward(env: Env, user: Address) -> Result<i128, VaultError> {
+        let _ = admin::get_admin(&env)?;
+        Self::pending_reward(&env, &user)
+    }
+
     /// Query total shares and deposited amounts.
     pub fn vault_state(env: Env) -> Result<(i128, i128), VaultError> {
-        let _ = admin::get_admin(&env)?; // ensures initialized
+        let _ = admin::get_admin(&env)?;
         Ok((
             balance::get_total_shares(&env),
             balance::get_total_deposited(&env),
@@ -163,18 +142,6 @@ impl VaultContract {
     }
 
     /// Pause all deposits and withdrawals (admin only).
-    ///
-    /// Sets the `Paused` flag to `true`. Any subsequent call to `deposit` or
-    /// `withdraw` will return `VaultError::VaultPaused` and make no state
-    /// changes until `unpause` is called. `add_yield` is also blocked while
-    /// paused. User share balances and the vault's token holdings are
-    /// unaffected by this call.
-    ///
-    /// Emits a `paused` event containing the admin address.
-    ///
-    /// # Errors
-    /// - `VaultError::NotInitialized` — contract has not been initialized.
-    /// - `VaultError::Unauthorized` — caller is not the current admin.
     pub fn pause(env: Env) -> Result<(), VaultError> {
         admin::require_admin(&env)?;
         env.storage().instance().set(&DataKey::Paused, &true);
@@ -184,15 +151,6 @@ impl VaultContract {
     }
 
     /// Resume deposits and withdrawals after a pause (admin only).
-    ///
-    /// Sets the `Paused` flag to `false`. Normal vault operations resume
-    /// immediately; no funds are moved by this call itself.
-    ///
-    /// Emits an `unpaused` event containing the admin address.
-    ///
-    /// # Errors
-    /// - `VaultError::NotInitialized` — contract has not been initialized.
-    /// - `VaultError::Unauthorized` — caller is not the current admin.
     pub fn unpause(env: Env) -> Result<(), VaultError> {
         admin::require_admin(&env)?;
         env.storage().instance().set(&DataKey::Paused, &false);
@@ -202,27 +160,7 @@ impl VaultContract {
     }
 
     /// Inject yield into the vault by transferring tokens from the admin wallet (admin only).
-    ///
-    /// Transfers `amount` tokens from `admin_addr` into the vault contract and
-    /// increments `total_deposited` by the same amount **without** minting new
-    /// shares. Because existing shares now represent a larger pool, the share
-    /// price rises proportionally for all current holders.
-    ///
-    /// The admin must hold at least `amount` tokens and must authorize the
-    /// transfer. This function cannot remove or redirect tokens that belong to
-    /// depositors — it only moves tokens *into* the vault.
-    ///
-    /// Requires the vault to be unpaused.
-    ///
-    /// Emits a `yield_add` event containing the admin address and amount.
-    ///
-    /// # Errors
-    /// - `VaultError::NotInitialized` — contract has not been initialized.
-    /// - `VaultError::Unauthorized` — caller is not the current admin.
-    /// - `VaultError::VaultPaused` — vault is currently paused.
-    /// - `VaultError::ZeroAmount` — `amount` is zero or negative.
     pub fn add_yield(env: Env, admin_addr: Address, amount: i128) -> Result<(), VaultError> {
-        // ensure caller is admin
         admin::require_admin(&env)?;
         Self::require_not_paused(&env)?;
 
@@ -236,15 +174,12 @@ impl VaultContract {
             .get(&DataKey::Token)
             .ok_or(VaultError::NotInitialized)?;
 
-        // Transfer tokens from admin into the vault contract
         let token_client = token::Client::new(&env, &token_addr);
         token_client.transfer(&admin_addr, &env.current_contract_address(), &amount);
 
-        // Increase total deposited, do NOT mint shares
         let total_deposited = balance::get_total_deposited(&env);
         balance::set_total_deposited(&env, total_deposited + amount);
 
-        // Emit event
         let admin_actual = admin::get_admin(&env)?;
         events::yield_added(&env, &admin_actual, amount);
 
@@ -252,15 +187,6 @@ impl VaultContract {
     }
 
     /// Transfer the admin role to a new address (admin only).
-    ///
-    /// Atomically replaces the stored admin address with `new_admin`. The
-    /// current admin loses all privileges the moment this transaction is
-    /// confirmed; `new_admin` gains them immediately. There is no two-phase
-    /// handoff — verify `new_admin` is accessible before calling.
-    ///
-    /// # Errors
-    /// - `VaultError::NotInitialized` — contract has not been initialized.
-    /// - `VaultError::Unauthorized` — caller is not the current admin.
     pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), VaultError> {
         admin::require_admin(&env)?;
         let old_admin = admin::get_admin(&env)?;
@@ -283,7 +209,7 @@ impl VaultContract {
 
     /// Query the current withdrawal limit per transaction.
     pub fn get_withdrawal_limit(env: Env) -> Result<i128, VaultError> {
-        let _ = admin::get_admin(&env)?; // ensures initialized
+        let _ = admin::get_admin(&env)?;
         Ok(balance::get_withdrawal_limit(&env).unwrap_or(0))
     }
 
@@ -300,19 +226,484 @@ impl VaultContract {
         if bps > 2000 {
             return Err(VaultError::InvalidPenaltyBps);
         }
-        env.storage().instance().set(&DataKey::EarlyExitPenaltyBps, &bps);
+        env.storage()
+            .instance()
+            .set(&DataKey::EarlyExitPenaltyBps, &bps);
         Ok(())
     }
 
     /// Query the current lock-up configuration: (lock_period, early_exit_penalty_bps).
     pub fn get_lock_config(env: Env) -> Result<(u32, u32), VaultError> {
-        let _ = admin::get_admin(&env)?; // ensures initialized
-        let lock_period = env.storage().instance().get(&DataKey::LockPeriod).unwrap_or(0);
-        let penalty_bps = env.storage().instance().get(&DataKey::EarlyExitPenaltyBps).unwrap_or(0);
+        let _ = admin::get_admin(&env)?;
+        let lock_period = env
+            .storage()
+            .instance()
+            .get(&DataKey::LockPeriod)
+            .unwrap_or(0);
+        let penalty_bps = env
+            .storage()
+            .instance()
+            .get(&DataKey::EarlyExitPenaltyBps)
+            .unwrap_or(0);
         Ok((lock_period, penalty_bps))
     }
 
+    /// Admin: set the minimum stake. Zero disables the minimum.
+    pub fn set_min_stake(env: Env, amount: i128) -> Result<(), VaultError> {
+        admin::require_admin(&env)?;
+        if amount < 0 {
+            return Err(VaultError::ZeroAmount);
+        }
+        balance::set_min_stake(&env, amount);
+        Ok(())
+    }
+
+    /// Read-only minimum stake value.
+    pub fn get_min_stake(env: Env) -> Result<i128, VaultError> {
+        let _ = admin::get_admin(&env)?;
+        Ok(balance::get_min_stake(&env))
+    }
+
+    /// Admin: set the base reward APR in basis points.
+    pub fn set_reward_rate_bps(env: Env, rate_bps: u32) -> Result<(), VaultError> {
+        admin::require_admin(&env)?;
+        balance::set_reward_rate_bps(&env, rate_bps);
+        Ok(())
+    }
+
+    /// Read-only reward rate APR in basis points.
+    pub fn get_reward_rate_bps(env: Env) -> Result<u32, VaultError> {
+        let _ = admin::get_admin(&env)?;
+        Ok(balance::get_reward_rate_bps(&env))
+    }
+
+    /// Admin: fund the separate reward pool used by `claim`.
+    pub fn fund_reward_pool(env: Env, admin_addr: Address, amount: i128) -> Result<(), VaultError> {
+        admin::require_admin(&env)?;
+        if amount <= 0 {
+            return Err(VaultError::ZeroAmount);
+        }
+
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(VaultError::NotInitialized)?;
+
+        let token_client = token::Client::new(&env, &token_addr);
+        token_client.transfer(&admin_addr, &env.current_contract_address(), &amount);
+
+        let reward_pool = balance::get_reward_pool_balance(&env);
+        balance::set_reward_pool_balance(&env, reward_pool + amount);
+
+        Ok(())
+    }
+
+    /// Read-only reward pool balance.
+    pub fn get_reward_pool_balance(env: Env) -> Result<i128, VaultError> {
+        let _ = admin::get_admin(&env)?;
+        Ok(balance::get_reward_pool_balance(&env))
+    }
+
+    /// Admin: set the reward boost schedule, capped at five tiers.
+    pub fn set_boost_schedule(env: Env, tiers: Vec<(u32, u32)>) -> Result<(), VaultError> {
+        admin::require_admin(&env)?;
+        if tiers.len() > MAX_BOOST_TIERS {
+            return Err(VaultError::TooManyBoostTiers);
+        }
+
+        let mut last_ledger = 0;
+        let mut index = 0;
+        while index < tiers.len() {
+            let (tier_ledger, multiplier_bps) = tiers.get(index).unwrap();
+            if multiplier_bps < BOOST_BPS_BASE {
+                return Err(VaultError::InvalidBoostSchedule);
+            }
+            if index > 0 && tier_ledger <= last_ledger {
+                return Err(VaultError::InvalidBoostSchedule);
+            }
+            last_ledger = tier_ledger;
+            index += 1;
+        }
+
+        balance::set_boost_schedule(&env, &tiers);
+        Ok(())
+    }
+
+    /// Read-only reward boost schedule.
+    pub fn get_boost_schedule(env: Env) -> Result<Vec<(u32, u32)>, VaultError> {
+        let _ = admin::get_admin(&env)?;
+        Ok(balance::get_boost_schedule(&env).unwrap_or(Vec::new(&env)))
+    }
+
+    /// Current reward multiplier for a user, based on `staked_at_ledger`.
+    pub fn get_boost_multiplier(env: Env, user: Address) -> Result<u32, VaultError> {
+        let _ = admin::get_admin(&env)?;
+        Ok(Self::boost_multiplier_for_ledger(
+            &env,
+            &user,
+            env.ledger().sequence(),
+        ))
+    }
+
     // --- Internal helpers ---
+
+    fn do_stake(env: &Env, staker: &Address, amount: i128) -> Result<i128, VaultError> {
+        staker.require_auth();
+        Self::require_not_paused(env)?;
+
+        if amount <= 0 {
+            return Err(VaultError::ZeroAmount);
+        }
+
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(VaultError::NotInitialized)?;
+
+        let total_shares = balance::get_total_shares(env);
+        let total_deposited = balance::get_total_deposited(env);
+        let current_shares = balance::get_shares(env, staker);
+
+        Self::require_min_stake(env, current_shares, total_shares, total_deposited, amount)?;
+        Self::accrue_rewards(env, staker, current_shares)?;
+
+        let shares = balance::amount_to_shares(total_shares, total_deposited, amount)
+            .ok_or(VaultError::ArithmeticError)?;
+
+        let token_client = token::Client::new(env, &token_addr);
+        token_client.transfer(staker, &env.current_contract_address(), &amount);
+
+        let new_shares = current_shares + shares;
+        balance::set_shares(env, staker, new_shares);
+        balance::set_total_shares(env, total_shares + shares);
+        balance::set_total_deposited(env, total_deposited + amount);
+
+        let current_ledger = env.ledger().sequence();
+        if current_shares == 0 {
+            env.storage()
+                .persistent()
+                .set(&DataKey::StakedAtLedger(staker.clone()), &current_ledger);
+        }
+        Self::record_stake_snapshot(env, staker, new_shares);
+
+        events::deposit(env, staker, amount, shares);
+
+        Ok(shares)
+    }
+
+    fn do_unstake(env: &Env, staker: &Address, shares: i128) -> Result<i128, VaultError> {
+        staker.require_auth();
+        Self::require_not_paused(env)?;
+
+        if shares <= 0 {
+            return Err(VaultError::ZeroAmount);
+        }
+
+        if let Some(limit) = balance::get_withdrawal_limit(env) {
+            if shares > limit {
+                return Err(VaultError::WithdrawalLimitExceeded);
+            }
+        }
+
+        let user_shares = balance::get_shares(env, staker);
+        if user_shares < shares {
+            return Err(VaultError::InsufficientShares);
+        }
+
+        Self::accrue_rewards(env, staker, user_shares)?;
+
+        let total_shares = balance::get_total_shares(env);
+        let total_deposited = balance::get_total_deposited(env);
+
+        let amount = balance::shares_to_amount(total_shares, total_deposited, shares)
+            .ok_or(VaultError::ArithmeticError)?;
+
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(VaultError::NotInitialized)?;
+
+        let lock_period = env
+            .storage()
+            .instance()
+            .get(&DataKey::LockPeriod)
+            .unwrap_or(0);
+        let penalty_bps = env
+            .storage()
+            .instance()
+            .get(&DataKey::EarlyExitPenaltyBps)
+            .unwrap_or(0);
+
+        let current_ledger = env.ledger().sequence();
+        let is_locked = if lock_period == 0 {
+            false
+        } else {
+            match env
+                .storage()
+                .persistent()
+                .get::<_, u32>(&DataKey::StakedAtLedger(staker.clone()))
+            {
+                Some(staked_at) => current_ledger < staked_at.saturating_add(lock_period),
+                None => false,
+            }
+        };
+
+        let amount_returned = if is_locked && penalty_bps > 0 {
+            let penalty = amount
+                .checked_mul(penalty_bps as i128)
+                .ok_or(VaultError::ArithmeticError)?
+                .checked_div(BOOST_BPS_BASE as i128)
+                .ok_or(VaultError::ArithmeticError)?;
+            amount - penalty
+        } else {
+            amount
+        };
+
+        let new_user_shares = user_shares - shares;
+        balance::set_shares(env, staker, new_user_shares);
+        balance::set_total_shares(env, total_shares - shares);
+        balance::set_total_deposited(env, total_deposited - amount_returned);
+
+        if new_user_shares == 0 {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::StakedAtLedger(staker.clone()));
+        }
+        Self::record_stake_snapshot(env, staker, new_user_shares);
+
+        let token_client = token::Client::new(env, &token_addr);
+        token_client.transfer(&env.current_contract_address(), staker, &amount_returned);
+
+        events::withdraw(env, staker, shares, amount_returned);
+
+        Ok(amount_returned)
+    }
+
+    fn require_min_stake(
+        env: &Env,
+        current_shares: i128,
+        total_shares: i128,
+        total_deposited: i128,
+        amount: i128,
+    ) -> Result<(), VaultError> {
+        let min_stake = balance::get_min_stake(env);
+        if min_stake == 0 {
+            return Ok(());
+        }
+
+        if current_shares == 0 {
+            return if amount < min_stake {
+                Err(VaultError::BelowMinimumStake)
+            } else {
+                Ok(())
+            };
+        }
+
+        let current_position =
+            balance::shares_to_amount(total_shares, total_deposited, current_shares)
+                .ok_or(VaultError::ArithmeticError)?;
+        let resulting_position = current_position
+            .checked_add(amount)
+            .ok_or(VaultError::ArithmeticError)?;
+
+        if resulting_position < min_stake {
+            Err(VaultError::BelowMinimumStake)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn record_stake_snapshot(env: &Env, user: &Address, amount: i128) {
+        let current_ledger = env.ledger().sequence();
+        let mut history = balance::get_stake_history(env, user).unwrap_or(Vec::new(env));
+
+        if history.len() > 0 {
+            let last_index = history.len() - 1;
+            let (last_ledger, _) = history.get(last_index).unwrap();
+            if last_ledger == current_ledger {
+                history.set(last_index, (current_ledger, amount));
+            } else {
+                history.push_back((current_ledger, amount));
+            }
+        } else {
+            history.push_back((current_ledger, amount));
+        }
+
+        while history.len() > MAX_HISTORY_SNAPSHOTS {
+            let _ = history.pop_front();
+        }
+
+        balance::set_stake_history(env, user, &history);
+    }
+
+    fn pending_reward(env: &Env, user: &Address) -> Result<i128, VaultError> {
+        let current_shares = balance::get_shares(env, user);
+        let accrued = balance::get_accrued_reward(env, user);
+        let checkpoint =
+            balance::get_reward_checkpoint_ledger(env, user).unwrap_or(env.ledger().sequence());
+
+        let pending_since_checkpoint = Self::reward_between_ledgers(
+            env,
+            user,
+            current_shares,
+            checkpoint,
+            env.ledger().sequence(),
+        )?;
+
+        accrued
+            .checked_add(pending_since_checkpoint)
+            .ok_or(VaultError::ArithmeticError)
+    }
+
+    fn accrue_rewards(env: &Env, user: &Address, current_shares: i128) -> Result<(), VaultError> {
+        let current_ledger = env.ledger().sequence();
+        let checkpoint = balance::get_reward_checkpoint_ledger(env, user).unwrap_or(current_ledger);
+        let additional_reward =
+            Self::reward_between_ledgers(env, user, current_shares, checkpoint, current_ledger)?;
+
+        if additional_reward > 0 {
+            let accrued = balance::get_accrued_reward(env, user);
+            let updated_accrued = accrued
+                .checked_add(additional_reward)
+                .ok_or(VaultError::ArithmeticError)?;
+            balance::set_accrued_reward(env, user, updated_accrued);
+        }
+
+        balance::set_reward_checkpoint_ledger(env, user, current_ledger);
+        Ok(())
+    }
+
+    fn reward_between_ledgers(
+        env: &Env,
+        user: &Address,
+        current_shares: i128,
+        start_ledger: u32,
+        end_ledger: u32,
+    ) -> Result<i128, VaultError> {
+        if current_shares == 0 || end_ledger <= start_ledger {
+            return Ok(0);
+        }
+
+        let rate_bps = balance::get_reward_rate_bps(env);
+        if rate_bps == 0 {
+            return Ok(0);
+        }
+
+        let staked_at = match env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::StakedAtLedger(user.clone()))
+        {
+            Some(ledger) => ledger,
+            None => return Ok(0),
+        };
+
+        let schedule = balance::get_boost_schedule(env).unwrap_or(Vec::new(env));
+        let mut reward: i128 = 0;
+        let mut cursor = start_ledger;
+        let mut current_multiplier =
+            Self::multiplier_for_elapsed(schedule.clone(), cursor.saturating_sub(staked_at));
+        let mut index = 0;
+
+        while index < schedule.len() {
+            let (tier_ledger, tier_multiplier) = schedule.get(index).unwrap();
+            let threshold = staked_at.saturating_add(tier_ledger);
+
+            if threshold <= cursor {
+                current_multiplier = tier_multiplier;
+                index += 1;
+                continue;
+            }
+
+            if threshold >= end_ledger {
+                break;
+            }
+
+            reward = reward
+                .checked_add(Self::reward_for_ledgers(
+                    current_shares,
+                    rate_bps,
+                    current_multiplier,
+                    threshold - cursor,
+                )?)
+                .ok_or(VaultError::ArithmeticError)?;
+
+            cursor = threshold;
+            current_multiplier = tier_multiplier;
+            index += 1;
+        }
+
+        reward = reward
+            .checked_add(Self::reward_for_ledgers(
+                current_shares,
+                rate_bps,
+                current_multiplier,
+                end_ledger - cursor,
+            )?)
+            .ok_or(VaultError::ArithmeticError)?;
+
+        Ok(reward)
+    }
+
+    fn reward_for_ledgers(
+        amount: i128,
+        rate_bps: u32,
+        multiplier_bps: u32,
+        elapsed_ledgers: u32,
+    ) -> Result<i128, VaultError> {
+        if elapsed_ledgers == 0 || amount == 0 {
+            return Ok(0);
+        }
+
+        let effective_rate_bps = (rate_bps as i128)
+            .checked_mul(multiplier_bps as i128)
+            .ok_or(VaultError::ArithmeticError)?
+            .checked_div(BOOST_BPS_BASE as i128)
+            .ok_or(VaultError::ArithmeticError)?;
+
+        amount
+            .checked_mul(effective_rate_bps)
+            .ok_or(VaultError::ArithmeticError)?
+            .checked_mul(elapsed_ledgers as i128)
+            .ok_or(VaultError::ArithmeticError)?
+            .checked_div(BOOST_BPS_BASE as i128)
+            .ok_or(VaultError::ArithmeticError)?
+            .checked_div(STELLAR_LEDGERS_PER_YEAR as i128)
+            .ok_or(VaultError::ArithmeticError)
+    }
+
+    fn boost_multiplier_for_ledger(env: &Env, user: &Address, ledger: u32) -> u32 {
+        let staked_at = match env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::StakedAtLedger(user.clone()))
+        {
+            Some(staked_at) => staked_at,
+            None => return BOOST_BPS_BASE,
+        };
+
+        let schedule = balance::get_boost_schedule(env).unwrap_or(Vec::new(env));
+        Self::multiplier_for_elapsed(schedule, ledger.saturating_sub(staked_at))
+    }
+
+    fn multiplier_for_elapsed(schedule: Vec<(u32, u32)>, elapsed: u32) -> u32 {
+        let mut multiplier = BOOST_BPS_BASE;
+        let mut index = 0;
+
+        while index < schedule.len() {
+            let (tier_ledger, tier_multiplier) = schedule.get(index).unwrap();
+            if elapsed < tier_ledger {
+                break;
+            }
+            multiplier = tier_multiplier;
+            index += 1;
+        }
+
+        multiplier
+    }
 
     fn require_not_paused(env: &Env) -> Result<(), VaultError> {
         let paused: bool = env

@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Stellar Wave](https://img.shields.io/badge/Stellar-Wave%20Program-blue)](https://www.drips.network/wave/stellar)
 
-A non-custodial, share-based DeFi yield vault built on **Stellar** using **Soroban** smart contracts (Rust). Users deposit a Stellar token and receive proportional vault shares in return. Shares accrue value as yield is added to the vault, and can be redeemed at any time for the underlying token.
+A non-custodial, share-based DeFi yield vault built on **Stellar** using **Soroban** smart contracts (Rust). Users deposit a Stellar token and receive proportional vault shares in return. Shares accrue value as yield is added to the vault, and can be redeemed at any time for the underlying token. The contract also exposes staking-oriented helpers for governance vote snapshots, minimum stake enforcement, reward claims, and time-based reward boosts.
 
 ## Architecture
 
@@ -12,9 +12,18 @@ A non-custodial, share-based DeFi yield vault built on **Stellar** using **Sorob
 VaultContract
 ├── initialize(admin, token)   — one-time setup
 ├── deposit(depositor, amount) — mint shares proportional to pool
+├── stake(staker, amount)      — staking-friendly alias for deposit
 ├── withdraw(user, shares)     — burn shares, return tokens
+├── unstake(staker, shares)    — staking-friendly alias for withdraw
+├── claim(staker)              — claim accrued reward tokens
+├── calc_pending_reward(user)  — read-only pending rewards
+├── vote_weight_at(user, lgr)  — historical governance weight
+├── current_vote_weight(user)  — current governance weight
+├── total_vote_weight()        — pool-wide governance weight
 ├── preview_redeem(shares)     — read-only: how much would I get?
 ├── vault_state()              — total shares & total deposited
+├── set_min_stake(amount)      — admin dust-position control
+├── set_boost_schedule(tiers)  — admin reward multiplier tiers
 ├── pause() / unpause()        — admin circuit breaker
 └── transfer_admin(new_admin)  — rotate admin key
 ```
@@ -63,14 +72,69 @@ cargo clippy --features testutils -- -D warnings
 |---|---|---|
 | `initialize(admin, token)` | — | One-time init |
 | `deposit(depositor, amount)` | depositor | Deposit tokens, receive shares |
+| `stake(staker, amount)` | staker | Alias for `deposit` |
 | `withdraw(user, shares)` | user | Burn shares, receive tokens |
+| `unstake(staker, shares)` | staker | Alias for `withdraw` |
+| `claim(staker)` | staker | Claim accrued rewards from the reward pool |
+| `calc_pending_reward(user)` | — | Pending reward query |
 | `shares_of(user)` | — | Query share balance |
+| `current_vote_weight(user)` | — | Current governance vote weight |
+| `vote_weight_at(user, ledger)` | — | Historical governance vote weight |
+| `total_vote_weight()` | — | Pool-wide governance vote weight |
 | `preview_redeem(shares)` | — | Preview token return |
 | `vault_state()` | — | Query pool totals |
+| `set_min_stake(amount)` | admin | Configure minimum stake; `0` disables it |
+| `get_min_stake()` | — | Read current minimum stake |
+| `set_reward_rate_bps(rate_bps)` | admin | Configure base reward APR |
+| `fund_reward_pool(admin_addr, amount)` | admin | Deposit claimable rewards |
+| `set_boost_schedule(tiers)` | admin | Configure up to 5 reward-boost tiers |
+| `get_boost_multiplier(user)` | — | Current reward multiplier for a user |
 | `pause()` | admin | Emergency pause |
 | `unpause()` | admin | Resume operations |
 | `add_yield(admin_addr, amount)` | admin | Inject yield; raises share price |
 | `transfer_admin(new_admin)` | admin | Rotate admin key |
+
+## Using the CLI Helper
+
+The repo includes [`scripts/pool.sh`](./scripts/pool.sh), an interactive helper for the most common pool operations:
+
+- `stake`
+- `unstake`
+- `claim`
+- `position`
+- `pending`
+- `pool-info`
+
+The script reads `CONTRACT_ID` and `IDENTITY` from your shell environment or a local `.env` file:
+
+```bash
+CONTRACT_ID=CB...YOUR_CONTRACT_ID
+IDENTITY=alice
+NETWORK=testnet
+```
+
+You can run it interactively:
+
+```bash
+scripts/pool.sh
+```
+
+Or invoke a specific action directly:
+
+```bash
+scripts/pool.sh stake 25000000 GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF
+scripts/pool.sh --dry-run pending GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF
+```
+
+Example output:
+
+```text
+$ scripts/pool.sh position GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF
+Address: GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF
+Staked shares: 2.5000000 (25000000 raw)
+Pending reward: 0.1375000 (1375000 raw)
+Boost multiplier: 11000 bps
+```
 
 ## Events
 

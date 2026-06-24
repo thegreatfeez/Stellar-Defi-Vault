@@ -270,6 +270,26 @@ impl VaultContract {
         Ok(balance::get_min_stake(&env))
     }
 
+    /// Admin: set the maximum TVL cap (in token units).
+    /// A cap of 0 means no limit.
+    pub fn set_pool_cap(env: Env, cap: i128) -> Result<(), VaultError> {
+        admin::require_admin(&env)?;
+        if cap < 0 {
+            return Err(VaultError::ZeroAmount);
+        }
+        balance::set_pool_cap(&env, cap);
+        let admin = admin::get_admin(&env)?;
+        events::pool_cap_updated(&env, &admin, cap);
+        Ok(())
+    }
+
+    /// Read-only pool cap value.
+    /// Returns 0 if no cap is set (unlimited).
+    pub fn get_pool_cap(env: Env) -> Result<i128, VaultError> {
+        let _ = admin::get_admin(&env)?;
+        Ok(balance::get_pool_cap(&env))
+    }
+
     /// Admin: set the base reward APR in basis points.
     pub fn set_reward_rate_bps(env: Env, rate_bps: u32) -> Result<(), VaultError> {
         admin::require_admin(&env)?;
@@ -467,6 +487,16 @@ impl VaultContract {
         Self::require_min_stake(&env, current_shares, total_shares, total_deposited, amount)?;
         Self::accrue_rewards(&env, &beneficiary, current_shares)?;
 
+        let cap = balance::get_pool_cap(&env);
+        if cap > 0 {
+            let new_total_deposited = total_deposited
+                .checked_add(amount)
+                .ok_or(VaultError::ArithmeticError)?;
+            if new_total_deposited > cap {
+                return Err(VaultError::PoolCapReached);
+            }
+        }
+
         let shares = balance::amount_to_shares(total_shares, total_deposited, amount)
             .ok_or(VaultError::ArithmeticError)?;
 
@@ -516,6 +546,16 @@ impl VaultContract {
 
         Self::require_min_stake(env, current_shares, total_shares, total_deposited, amount)?;
         Self::accrue_rewards(env, staker, current_shares)?;
+
+        let cap = balance::get_pool_cap(env);
+        if cap > 0 {
+            let new_total_deposited = total_deposited
+                .checked_add(amount)
+                .ok_or(VaultError::ArithmeticError)?;
+            if new_total_deposited > cap {
+                return Err(VaultError::PoolCapReached);
+            }
+        }
 
         let shares = balance::amount_to_shares(total_shares, total_deposited, amount)
             .ok_or(VaultError::ArithmeticError)?;

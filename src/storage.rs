@@ -24,6 +24,7 @@ pub enum DataKey {
     TotalStakers,
     TotalRewardsPaid,
     Delegate(Address),
+    PoolCap,
 }
 
 #[contracttype]

@@ -813,3 +813,178 @@ fn test_reward_checkpoint_on_top_up_avoids_overpaying() {
     set_ledger(&f.env, 200);
     assert_eq!(f.vault.calc_pending_reward(&f.alice), 300);
 }
+
+// ── pool cap (TVL limit) ──────────────────────────────────────────────────────
+
+#[test]
+fn test_stake_within_cap_succeeds() {
+    let f = VaultFixture::new();
+    f.vault.set_pool_cap(&1_000_000);
+
+    let shares = f.vault.stake(&f.alice, &500_000);
+    assert_eq!(shares, 500_000);
+    assert_eq!(f.vault.shares_of(&f.alice), 500_000);
+
+    let cap = f.vault.get_pool_cap();
+    assert_eq!(cap, 1_000_000);
+}
+
+#[test]
+fn test_stake_exceeding_cap_fails() {
+    let f = VaultFixture::new();
+    f.vault.set_pool_cap(&1_000_000);
+
+    f.vault.stake(&f.alice, &800_000);
+
+    let result = f.vault.try_stake(&f.alice, &300_000);
+    assert_eq!(result, Err(Ok(VaultError::PoolCapReached)));
+}
+
+#[test]
+fn test_stake_at_exact_cap_boundary_succeeds() {
+    let f = VaultFixture::new();
+    f.vault.set_pool_cap(&1_000_000);
+
+    f.vault.stake(&f.alice, &900_000);
+
+    let shares = f.vault.stake(&f.bob, &100_000);
+    assert_eq!(shares, 100_000);
+
+    let (_shares, total_deposited) = f.vault.vault_state();
+    assert_eq!(total_deposited, 1_000_000);
+}
+
+#[test]
+fn test_stake_one_over_cap_fails() {
+    let f = VaultFixture::new();
+    f.vault.set_pool_cap(&1_000_000);
+
+    f.vault.stake(&f.alice, &900_000);
+
+    let result = f.vault.try_stake(&f.bob, &100_001);
+    assert_eq!(result, Err(Ok(VaultError::PoolCapReached)));
+}
+
+#[test]
+fn test_cap_disabled_allows_unlimited_staking() {
+    let f = VaultFixture::new();
+    f.vault.set_pool_cap(&0);
+
+    f.vault.stake(&f.alice, &10_000_000);
+    f.vault.stake(&f.bob, &20_000_000);
+
+    let (_shares, total_deposited) = f.vault.vault_state();
+    assert_eq!(total_deposited, 30_000_000);
+}
+
+#[test]
+fn test_admin_can_raise_and_lower_cap() {
+    let f = VaultFixture::new();
+    f.vault.set_pool_cap(&500_000);
+    assert_eq!(f.vault.get_pool_cap(), 500_000);
+
+    f.vault.set_pool_cap(&2_000_000);
+    assert_eq!(f.vault.get_pool_cap(), 2_000_000);
+
+    f.vault.set_pool_cap(&1_000_000);
+    assert_eq!(f.vault.get_pool_cap(), 1_000_000);
+}
+
+#[test]
+fn test_non_admin_cannot_set_pool_cap() {
+    let f = VaultFixture::new();
+
+    let result = f.vault.try_set_pool_cap(&1_000_000);
+    assert_eq!(result, Err(Ok(VaultError::Unauthorized)));
+}
+
+#[test]
+fn test_lowering_cap_below_current_tvl_blocks_new_stakes() {
+    let f = VaultFixture::new();
+    f.vault.set_pool_cap(&1_000_000);
+
+    f.vault.stake(&f.alice, &1_000_000);
+
+    f.vault.set_pool_cap(&500_000);
+    assert_eq!(f.vault.get_pool_cap(), 500_000);
+
+    let (_shares, total_deposited) = f.vault.vault_state();
+    assert_eq!(total_deposited, 1_000_000);
+
+    let result = f.vault.try_stake(&f.bob, &1);
+    assert_eq!(result, Err(Ok(VaultError::PoolCapReached)));
+}
+
+#[test]
+fn test_existing_stakers_unaffected_when_cap_lowered() {
+    let f = VaultFixture::new();
+    f.vault.set_pool_cap(&1_000_000);
+
+    f.vault.stake(&f.alice, &1_000_000);
+
+    f.vault.set_pool_cap(&500_000);
+
+    let shares = f.vault.shares_of(&f.alice);
+    assert_eq!(shares, 1_000_000);
+
+    let preview = f.vault.preview_redeem(&shares);
+    assert_eq!(preview, 1_000_000);
+
+    let withdrawn = f.vault.withdraw(&f.alice, &shares);
+    assert_eq!(withdrawn, 1_000_000);
+}
+
+#[test]
+fn test_pool_cap_updated_emits_event() {
+    let f = VaultFixture::new();
+
+    f.vault.set_pool_cap(&1_000_000);
+
+    let events = f.env.events().all();
+    let cap_events: std::vec::Vec<_> = events
+        .into_iter()
+        .filter(|(_, topics, _)| {
+            let symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
+            symbol == Symbol::new(&f.env, "cap_upd")
+        })
+        .collect();
+
+    assert_eq!(cap_events.len(), 1);
+    let event = &cap_events[0];
+    assert_eq!(
+        Address::try_from_val(&f.env, &event.1.get(1).unwrap()).unwrap(),
+        f.admin
+    );
+    assert_eq!(i128::try_from_val(&f.env, &event.2.get(0).unwrap()).unwrap(), 1_000_000);
+}
+
+#[test]
+fn test_pool_cap_defaults_to_zero() {
+    let f = VaultFixture::new();
+
+    assert_eq!(f.vault.get_pool_cap(), 0);
+}
+
+#[test]
+fn test_stake_for_respects_pool_cap() {
+    let f = VaultFixture::new();
+    f.vault.set_pool_cap(&1_000_000);
+
+    f.vault.approve_delegate(&f.alice, &f.bob);
+
+    f.vault.stake(&f.alice, &800_000);
+
+    let result = f.vault.try_stake_for(&f.bob, &f.alice, &300_000);
+    assert_eq!(result, Err(Ok(VaultError::PoolCapReached)));
+
+    let shares = f.vault.stake_for(&f.bob, &f.alice, &100_000);
+    assert_eq!(shares, 100_000);
+}
+
+#[test]
+fn test_set_pool_cap_negative_fails() {
+    let f = VaultFixture::new();
+
+    let result = f.vault.try_set_pool_cap(&-1);
+    assert_eq!(result, Err(Ok(VaultError::ZeroAmount)));
+}

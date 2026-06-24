@@ -19,4 +19,5 @@ pub enum VaultError {
     InvalidBoostSchedule = 13,
     InsufficientRewardPool = 14,
     NotADelegate = 15,
+    PoolCapReached = 16,
 }

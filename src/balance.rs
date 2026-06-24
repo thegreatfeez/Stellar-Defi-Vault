@@ -85,6 +85,17 @@ pub fn set_withdrawal_limit(env: &Env, limit: i128) {
         .set(&DataKey::WithdrawalLimit, &limit);
 }
 
+pub fn get_pool_cap(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::PoolCap)
+        .unwrap_or(0)
+}
+
+pub fn set_pool_cap(env: &Env, cap: i128) {
+    env.storage().instance().set(&DataKey::PoolCap, &cap);
+}
+
 pub fn get_reward_checkpoint_ledger(env: &Env, user: &Address) -> Option<u32> {
     env.storage()
         .persistent()

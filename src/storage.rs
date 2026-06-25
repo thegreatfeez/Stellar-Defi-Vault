@@ -6,7 +6,7 @@ use soroban_sdk::{contracttype, Address};
 /// MinStake, RewardRateBps, RewardPoolBalance, BoostSchedule, Paused,
 /// WithdrawalLimit, LockPeriod, EarlyExitPenaltyBps, TotalStakers,
 /// TotalRewardsPaid, SlashTreasury, WhitelistEnabled, CooldownPeriod,
-/// PoolCap, ClaimCap, ClaimCapWindow.
+/// PoolCap, ClaimCap, ClaimCapWindow, StakeDecimals, RewardDecimals.
 ///
 /// Persistent keys (per-user, long-lived): ShareBalance, StakeHistory,
 /// RewardCheckpointLedger, LastClaimLedger, AccruedReward, StakedAtLedger,
@@ -53,6 +53,10 @@ pub enum DataKey {
     ClaimCapWindow,
     /// Per-user running total of rewards claimed within the current window.
     UserClaimWindow(Address),
+    /// Decimal precision of the stake token (defaults to 7 when unset).
+    StakeDecimals,
+    /// Decimal precision of the reward token (defaults to 7 when unset).
+    RewardDecimals,
 }
 
 #[contracttype]

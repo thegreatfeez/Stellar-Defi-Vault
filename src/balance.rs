@@ -245,6 +245,38 @@ pub fn set_user_claim_window(env: &Env, user: &Address, window: &ClaimWindow) {
         .set(&DataKey::UserClaimWindow(user.clone()), window);
 }
 
+// ── Token decimals (reward normalization) ─────────────────────────────────────
+
+/// Default decimal precision for Stellar tokens. Most tokens use 7 places,
+/// but this is only a fallback for pools initialized without explicit values.
+pub const DEFAULT_TOKEN_DECIMALS: u32 = 7;
+
+pub fn get_stake_decimals(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::StakeDecimals)
+        .unwrap_or(DEFAULT_TOKEN_DECIMALS)
+}
+
+pub fn set_stake_decimals(env: &Env, decimals: u32) {
+    env.storage()
+        .instance()
+        .set(&DataKey::StakeDecimals, &decimals);
+}
+
+pub fn get_reward_decimals(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::RewardDecimals)
+        .unwrap_or(DEFAULT_TOKEN_DECIMALS)
+}
+
+pub fn set_reward_decimals(env: &Env, decimals: u32) {
+    env.storage()
+        .instance()
+        .set(&DataKey::RewardDecimals, &decimals);
+}
+
 // ── Share math ────────────────────────────────────────────────────────────────
 
 /// Convert a deposit amount to shares using current vault ratio.

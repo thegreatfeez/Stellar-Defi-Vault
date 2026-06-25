@@ -10,7 +10,7 @@ A non-custodial, share-based DeFi yield vault built on **Stellar** using **Sorob
 
 ```
 VaultContract
-├── initialize(admin, token)   — one-time setup
+├── initialize(admin, token, stake_decimals?, reward_decimals?) — one-time setup (decimals default to 7)
 ├── deposit(depositor, amount) — mint shares proportional to pool
 ├── stake(staker, amount)      — staking-friendly alias for deposit
 ├── withdraw(user, shares)     — burn shares, return tokens
@@ -70,7 +70,7 @@ cargo clippy --features testutils -- -D warnings
 
 | Function | Auth Required | Description |
 |---|---|---|
-| `initialize(admin, token)` | — | One-time init |
+| `initialize(admin, token, stake_decimals?, reward_decimals?)` | — | One-time init; decimals default to 7 |
 | `deposit(depositor, amount)` | depositor | Deposit tokens, receive shares |
 | `stake(staker, amount)` | staker | Alias for `deposit` |
 | `withdraw(user, shares)` | user | Burn shares, receive tokens |

@@ -66,6 +66,19 @@ impl<'a> VaultFixture<'a> {
     }
 
     fn with_mock_auths(mock_auths: bool) -> Self {
+        Self::build(mock_auths, None, None)
+    }
+
+    /// Build a fixture with explicit stake/reward token decimals.
+    fn with_decimals(stake_decimals: u32, reward_decimals: u32) -> Self {
+        Self::build(true, Some(stake_decimals), Some(reward_decimals))
+    }
+
+    fn build(
+        mock_auths: bool,
+        stake_decimals: Option<u32>,
+        reward_decimals: Option<u32>,
+    ) -> Self {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().with_mut(|li| {
@@ -83,7 +96,7 @@ impl<'a> VaultFixture<'a> {
         let vault_id = env.register_contract(None, VaultContract);
         let vault = VaultContractClient::new(&env, &vault_id);
 
-        vault.initialize(&admin, &token_addr);
+        vault.initialize(&admin, &token_addr, &stake_decimals, &reward_decimals);
 
         // Mint starting balances
         token_admin.mint(&alice, &20_000_000);
@@ -121,7 +134,7 @@ fn test_double_initialize_fails() {
     let token_addr: soroban_sdk::Address = f
         .env
         .register_stellar_asset_contract(Address::generate(&f.env));
-    let result = f.vault.try_initialize(&f.admin, &token_addr);
+    let result = f.vault.try_initialize(&f.admin, &token_addr, &None, &None);
     assert_eq!(result, Err(Ok(VaultError::AlreadyInitialized)));
 }
 
@@ -840,6 +853,66 @@ fn test_reward_checkpoint_on_top_up_avoids_overpaying() {
 
     set_ledger(&f.env, 200);
     assert_eq!(f.vault.calc_pending_reward(&f.alice), 300);
+}
+
+// ── reward token decimal normalization ────────────────────────────────────────
+
+#[test]
+fn test_initialize_defaults_decimals_to_seven() {
+    // Pools initialized without explicit decimals fall back to 7/7.
+    let f = VaultFixture::new();
+    assert_eq!(f.vault.stake_decimals(), 7);
+    assert_eq!(f.vault.reward_decimals(), 7);
+}
+
+#[test]
+fn test_initialize_stores_custom_decimals() {
+    let f = VaultFixture::with_decimals(7, 6);
+    assert_eq!(f.vault.stake_decimals(), 7);
+    assert_eq!(f.vault.reward_decimals(), 6);
+}
+
+#[test]
+fn test_pending_reward_same_decimals_unchanged() {
+    // With matching decimals the normalized reward equals the raw reward,
+    // preserving the existing behaviour. Raw reward over `n` ledgers at a
+    // 100% APR on a one-year stake is exactly `n`.
+    let f = VaultFixture::with_decimals(7, 7);
+    let annual_stake = STELLAR_LEDGERS_PER_YEAR as i128;
+
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+    f.vault.stake(&f.alice, &annual_stake);
+
+    set_ledger(&f.env, 100);
+    assert_eq!(f.vault.calc_pending_reward(&f.alice), 100);
+}
+
+#[test]
+fn test_pending_reward_scaled_down_when_reward_decimals_smaller() {
+    // Reward token has fewer decimals than the stake token (6 vs 7), so the
+    // raw reward of 100 is divided by 10^(7-6) = 10.
+    let f = VaultFixture::with_decimals(7, 6);
+    let annual_stake = STELLAR_LEDGERS_PER_YEAR as i128;
+
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+    f.vault.stake(&f.alice, &annual_stake);
+
+    set_ledger(&f.env, 100);
+    assert_eq!(f.vault.calc_pending_reward(&f.alice), 10);
+}
+
+#[test]
+fn test_pending_reward_scaled_up_when_reward_decimals_larger() {
+    // Reward token has more decimals than the stake token (9 vs 7), so the
+    // raw reward of 100 is multiplied by 10^(9-7) = 100.
+    let f = VaultFixture::with_decimals(7, 9);
+    let annual_stake = STELLAR_LEDGERS_PER_YEAR as i128;
+
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+    f.vault.stake(&f.alice, &annual_stake);
+
+    set_ledger(&f.env, 100);
+    assert_eq!(f.vault.calc_pending_reward(&f.alice), 10_000);
 }
 
 // ── pool cap (TVL limit) ──────────────────────────────────────────────────────

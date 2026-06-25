@@ -17,7 +17,19 @@ pub struct VaultContract;
 #[contractimpl]
 impl VaultContract {
     /// Initialize the vault with an admin and the token it accepts.
-    pub fn initialize(env: Env, admin: Address, token: Address) -> Result<(), VaultError> {
+    ///
+    /// `stake_decimals` and `reward_decimals` declare the decimal precision of
+    /// the stake and reward tokens so reward amounts can be normalized when the
+    /// two tokens differ. Both are optional and default to 7 (the Stellar
+    /// standard) when `None` is passed, keeping pools initialized without
+    /// explicit decimals backward compatible.
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        token: Address,
+        stake_decimals: Option<u32>,
+        reward_decimals: Option<u32>,
+    ) -> Result<(), VaultError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(VaultError::AlreadyInitialized);
         }
@@ -27,6 +39,17 @@ impl VaultContract {
         env.storage().instance().set(&DataKey::Paused, &false);
         // By default, set the slash treasury to the admin address. Can be updated by admin later.
         env.storage().instance().set(&DataKey::SlashTreasury, &admin);
+
+        // Persist token decimals so reward math can normalize across mismatched
+        // precisions. Unspecified values fall back to the Stellar standard of 7.
+        balance::set_stake_decimals(
+            &env,
+            stake_decimals.unwrap_or(balance::DEFAULT_TOKEN_DECIMALS),
+        );
+        balance::set_reward_decimals(
+            &env,
+            reward_decimals.unwrap_or(balance::DEFAULT_TOKEN_DECIMALS),
+        );
         Ok(())
     }
 
@@ -175,10 +198,23 @@ impl VaultContract {
             .ok_or(VaultError::ArithmeticError)
     }
 
-    /// Read-only query for pending staking rewards.
+    /// Read-only query for pending staking rewards, expressed in reward token
+    /// decimals. Internally rewards accrue in stake token precision, so the
+    /// result is normalized to the reward token's precision before returning.
     pub fn calc_pending_reward(env: Env, user: Address) -> Result<i128, VaultError> {
         let _ = admin::get_admin(&env)?;
-        Self::pending_reward(&env, &user)
+        let raw = Self::pending_reward(&env, &user)?;
+        Self::normalize_to_reward_decimals(&env, raw)
+    }
+
+    /// Read-only query for the configured stake token decimal precision.
+    pub fn stake_decimals(env: Env) -> u32 {
+        balance::get_stake_decimals(&env)
+    }
+
+    /// Read-only query for the configured reward token decimal precision.
+    pub fn reward_decimals(env: Env) -> u32 {
+        balance::get_reward_decimals(&env)
     }
 
     /// Query total shares and deposited amounts.
@@ -1484,6 +1520,49 @@ impl VaultContract {
             .ok_or(VaultError::ArithmeticError)?;
 
         Ok(reward)
+    }
+
+    /// Normalize a reward computed in stake token precision to reward token
+    /// precision.
+    ///
+    /// Rewards are derived from staked amounts, so they inherit the stake
+    /// token's decimal scale. When the reward token uses a different precision
+    /// the value must be rescaled by the ratio of the two scales:
+    ///
+    ///     normalized = raw * 10^reward_decimals / 10^stake_decimals
+    ///
+    /// To preserve precision and avoid spurious overflow this is applied as a
+    /// single multiply or divide by `10^|reward_decimals - stake_decimals|`:
+    ///   - reward_decimals > stake_decimals → scale up (multiply)
+    ///   - reward_decimals < stake_decimals → scale down (divide, truncating)
+    ///   - reward_decimals == stake_decimals → unchanged
+    fn normalize_to_reward_decimals(env: &Env, raw: i128) -> Result<i128, VaultError> {
+        let stake_decimals = balance::get_stake_decimals(env);
+        let reward_decimals = balance::get_reward_decimals(env);
+
+        if reward_decimals == stake_decimals {
+            return Ok(raw);
+        }
+
+        if reward_decimals > stake_decimals {
+            let factor = Self::pow10(reward_decimals - stake_decimals)?;
+            raw.checked_mul(factor).ok_or(VaultError::ArithmeticError)
+        } else {
+            let factor = Self::pow10(stake_decimals - reward_decimals)?;
+            // factor is always >= 10, so division is safe.
+            Ok(raw / factor)
+        }
+    }
+
+    /// Compute `10^exp` as an `i128`, returning `ArithmeticError` on overflow.
+    fn pow10(exp: u32) -> Result<i128, VaultError> {
+        let mut result: i128 = 1;
+        let mut i = 0;
+        while i < exp {
+            result = result.checked_mul(10).ok_or(VaultError::ArithmeticError)?;
+            i += 1;
+        }
+        Ok(result)
     }
 
     fn reward_for_ledgers(

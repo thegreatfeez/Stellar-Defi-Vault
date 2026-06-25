@@ -34,6 +34,8 @@ pub enum DataKey {
     // Per-user unbonding position stored when request_unstake is called.
     UnbondingPosition(Address),
     PoolCap,
+    // Rate change history: Vec<(ledger, rate_bps)> capped at 50 entries
+    RateHistory,
 }
 
 #[contracttype]

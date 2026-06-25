@@ -26,4 +26,6 @@ pub enum VaultError {
     NotWhitelisted = 18,
     /// Unstake must use request_unstake / execute_unstake flow when cooldown is enabled.
     UseCooldownFlow = 19,
+    /// Unstake fee exceeds the maximum allowed (500 bps / 5%).
+    UnstakeFeeTooHigh = 20,
 }

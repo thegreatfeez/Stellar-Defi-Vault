@@ -85,6 +85,8 @@ cargo clippy --features testutils -- -D warnings
 | `vault_state()` | — | Query pool totals |
 | `set_min_stake(amount)` | admin | Configure minimum stake; `0` disables it |
 | `get_min_stake()` | — | Read current minimum stake |
+| `set_unstake_fee_bps(admin, bps)` | admin | Configure unstake fee (max 500 bps); `0` disables it |
+| `get_unstake_fee_bps()` | — | Read current unstake fee in bps |
 | `set_reward_rate_bps(rate_bps)` | admin | Configure base reward APR |
 | `fund_reward_pool(admin_addr, amount)` | admin | Deposit claimable rewards |
 | `set_boost_schedule(tiers)` | admin | Configure up to 5 reward-boost tiers |

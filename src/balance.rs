@@ -111,6 +111,17 @@ pub fn set_pool_cap(env: &Env, cap: i128) {
     env.storage().instance().set(&DataKey::PoolCap, &cap);
 }
 
+pub fn get_unstake_fee_bps(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::UnstakeFeeBps)
+        .unwrap_or(0)
+}
+
+pub fn set_unstake_fee_bps(env: &Env, bps: u32) {
+    env.storage().instance().set(&DataKey::UnstakeFeeBps, &bps);
+}
+
 pub fn get_reward_checkpoint_ledger(env: &Env, user: &Address) -> Option<u32> {
     env.storage()
         .persistent()

@@ -10,6 +10,7 @@ pub(crate) const BOOST_BPS_BASE: u32 = 10_000;
 pub(crate) const MAX_BOOST_TIERS: u32 = 5;
 pub(crate) const MAX_HISTORY_SNAPSHOTS: u32 = 100;
 pub(crate) const STELLAR_LEDGERS_PER_YEAR: u32 = 6_307_200;
+pub(crate) const MAX_UNSTAKE_FEE_BPS: u32 = 500;
 
 #[contract]
 pub struct VaultContract;
@@ -479,6 +480,27 @@ impl VaultContract {
             .get(&DataKey::EarlyExitPenaltyBps)
             .unwrap_or(0);
         Ok((lock_period, penalty_bps))
+    }
+
+    /// Admin: set the unstake fee in basis points charged on exit.
+    ///
+    /// The fee is deducted from the principal returned to the user (after any
+    /// lock-up penalty) and routed to the reward pool treasury. Pass `0` to
+    /// disable. The maximum is 500 bps (5%); higher values are rejected with
+    /// `UnstakeFeeTooHigh`.
+    pub fn set_unstake_fee_bps(env: Env, admin: Address, bps: u32) -> Result<(), VaultError> {
+        admin::require_admin(&env)?;
+        let _ = admin; // argument follows existing admin patterns; auth enforced above
+        if bps > MAX_UNSTAKE_FEE_BPS {
+            return Err(VaultError::UnstakeFeeTooHigh);
+        }
+        balance::set_unstake_fee_bps(&env, bps);
+        Ok(())
+    }
+
+    /// Read-only query for the current unstake fee in basis points.
+    pub fn get_unstake_fee_bps(env: Env) -> u32 {
+        balance::get_unstake_fee_bps(&env)
     }
 
     /// Admin: set the minimum stake. Zero disables the minimum.
@@ -1240,7 +1262,10 @@ impl VaultContract {
             .instance()
             .get(&DataKey::LockPeriod)
             .unwrap_or(0);
-        let penalty_bps = env
+        // Must be read as u32 to match how `set_early_exit_penalty_bps` stores
+        // it; an inferred `i32` would panic on deserialization once a penalty
+        // is configured.
+        let penalty_bps: u32 = env
             .storage()
             .instance()
             .get(&DataKey::EarlyExitPenaltyBps)
@@ -1260,7 +1285,7 @@ impl VaultContract {
             }
         };
 
-        let amount_returned = if is_locked && penalty_bps > 0 {
+        let amount_after_penalty = if is_locked && penalty_bps > 0 {
             let penalty = amount
                 .checked_mul(penalty_bps as i128)
                 .ok_or(VaultError::ArithmeticError)?
@@ -1271,10 +1296,32 @@ impl VaultContract {
             amount
         };
 
+        // Unstake fee: charged on the post-penalty amount returned to the user
+        // and routed to the reward pool treasury (not burned). Applied after the
+        // lock-up penalty so both can be active simultaneously.
+        let unstake_fee_bps = balance::get_unstake_fee_bps(env);
+        let unstake_fee = if unstake_fee_bps > 0 {
+            amount_after_penalty
+                .checked_mul(unstake_fee_bps as i128)
+                .ok_or(VaultError::ArithmeticError)?
+                .checked_div(BOOST_BPS_BASE as i128)
+                .ok_or(VaultError::ArithmeticError)?
+        } else {
+            0
+        };
+        let amount_returned = amount_after_penalty - unstake_fee;
+
         let new_user_shares = user_shares - shares;
         balance::set_shares(env, staker, new_user_shares);
         balance::set_total_shares(env, total_shares - shares);
-        balance::set_total_deposited(env, total_deposited - amount_returned);
+        // Both the returned principal and the fee leave the staked pool; the fee
+        // is credited to the reward treasury below.
+        balance::set_total_deposited(env, total_deposited - amount_returned - unstake_fee);
+
+        if unstake_fee > 0 {
+            let reward_pool = balance::get_reward_pool_balance(env);
+            balance::set_reward_pool_balance(env, reward_pool + unstake_fee);
+        }
 
         if new_user_shares == 0 {
             env.storage()

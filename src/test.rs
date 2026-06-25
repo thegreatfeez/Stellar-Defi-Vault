@@ -669,6 +669,89 @@ fn test_lock_config_query() {
     assert_eq!(penalty_bps, 1500);
 }
 
+// ── unstake fee (separate from withdrawal fee) ────────────────────────────────
+
+#[test]
+fn test_set_and_get_unstake_fee_bps() {
+    let f = VaultFixture::new();
+    assert_eq!(f.vault.get_unstake_fee_bps(), 0);
+
+    f.vault.set_unstake_fee_bps(&f.admin, &250);
+    assert_eq!(f.vault.get_unstake_fee_bps(), 250);
+}
+
+#[test]
+fn test_set_unstake_fee_bps_requires_admin_auth() {
+    let f = VaultFixture::new();
+    f.vault.set_unstake_fee_bps(&f.admin, &100);
+    assert_eq!(f.env.auths()[0].0, f.admin);
+}
+
+#[test]
+fn test_set_unstake_fee_bps_allows_max() {
+    let f = VaultFixture::new();
+    f.vault.set_unstake_fee_bps(&f.admin, &500);
+    assert_eq!(f.vault.get_unstake_fee_bps(), 500);
+}
+
+#[test]
+fn test_set_unstake_fee_bps_too_high_rejected() {
+    let f = VaultFixture::new();
+    let result = f.vault.try_set_unstake_fee_bps(&f.admin, &501);
+    assert_eq!(result, Err(Ok(VaultError::UnstakeFeeTooHigh)));
+}
+
+#[test]
+fn test_unstake_with_zero_fee_returns_full_principal() {
+    let f = VaultFixture::new();
+    f.vault.deposit(&f.alice, &600_000);
+
+    let token_before = f.token.balance(&f.alice);
+    let amount_back = f.vault.withdraw(&f.alice, &300_000);
+
+    assert_eq!(amount_back, 300_000);
+    assert_eq!(f.token.balance(&f.alice), token_before + 300_000);
+    // No fee configured, so nothing is routed to the treasury.
+    assert_eq!(f.vault.get_reward_pool_balance(), 0);
+}
+
+#[test]
+fn test_unstake_deducts_fee_and_credits_treasury() {
+    let f = VaultFixture::new();
+    f.vault.set_unstake_fee_bps(&f.admin, &500); // 5%
+    f.vault.deposit(&f.alice, &600_000);
+
+    let token_before = f.token.balance(&f.alice);
+    let amount_back = f.vault.withdraw(&f.alice, &300_000);
+
+    // 5% of 300_000 = 15_000 fee; 285_000 returned to the user.
+    assert_eq!(amount_back, 285_000);
+    assert_eq!(f.token.balance(&f.alice), token_before + 285_000);
+    // Fee is routed to the reward pool treasury, not burned.
+    assert_eq!(f.vault.get_reward_pool_balance(), 15_000);
+}
+
+#[test]
+fn test_unstake_fee_applies_after_lock_penalty() {
+    let f = VaultFixture::new();
+    f.vault.set_lock_period(&100);
+    f.vault.set_early_exit_penalty_bps(&1000); // 10%
+    f.vault.set_unstake_fee_bps(&f.admin, &500); // 5%
+
+    set_ledger(&f.env, 1);
+    f.vault.deposit(&f.alice, &1_000_000);
+
+    let token_before = f.token.balance(&f.alice);
+    set_ledger(&f.env, 50); // still within the lock-up window
+    let amount_back = f.vault.withdraw(&f.alice, &1_000_000);
+
+    // Penalty first: 10% of 1_000_000 = 100_000 -> 900_000 after penalty.
+    // Fee on the remainder: 5% of 900_000 = 45_000 -> 855_000 returned.
+    assert_eq!(amount_back, 855_000);
+    assert_eq!(f.token.balance(&f.alice), token_before + 855_000);
+    assert_eq!(f.vault.get_reward_pool_balance(), 45_000);
+}
+
 // ── governance vote weight snapshots (Issue #31) ─────────────────────────────
 
 #[test]
@@ -1382,3 +1465,14 @@ fn test_cap_zero_disables_limit() {
     let window_opt = f.vault.get_claim_window(&f.alice);
     assert!(window_opt.is_none(), "no window stored when cap is disabled");
 }
+
+
+
+
+
+
+
+
+
+
+

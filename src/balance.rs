@@ -62,6 +62,21 @@ pub fn set_reward_rate_bps(env: &Env, rate_bps: u32) {
         .set(&DataKey::RewardRateBps, &rate_bps);
 }
 
+pub fn get_rate_history(env: &Env) -> Vec<(u32, u32)> {
+    env.storage()
+        .instance()
+        .get(&DataKey::RateHistory)
+        .unwrap_or(Vec::new(env))
+}
+
+pub fn set_rate_history(env: &Env, history: &Vec<(u32, u32)>) {
+    env.storage()
+        .instance()
+        .set(&DataKey::RateHistory, history);
+}
+
+pub const MAX_RATE_HISTORY_ENTRIES: u32 = 50;
+
 pub fn get_reward_pool_balance(env: &Env) -> i128 {
     env.storage()
         .instance()

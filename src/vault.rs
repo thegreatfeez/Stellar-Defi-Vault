@@ -522,6 +522,18 @@ impl VaultContract {
     pub fn set_reward_rate_bps(env: Env, rate_bps: u32) -> Result<(), VaultError> {
         admin::require_admin(&env)?;
         let old_rate = balance::get_reward_rate_bps(&env);
+        
+        // Append to rate history before changing rate
+        let current_ledger = env.ledger().sequence();
+        let mut history = balance::get_rate_history(&env);
+        history.push_back((current_ledger, old_rate));
+        
+        // Cap history at 50 entries
+        while history.len() > balance::MAX_RATE_HISTORY_ENTRIES {
+            history.pop_front();
+        }
+        
+        balance::set_rate_history(&env, &history);
         balance::set_reward_rate_bps(&env, rate_bps);
         events::rate_changed(&env, old_rate, rate_bps);
         Ok(())
@@ -531,6 +543,91 @@ impl VaultContract {
     pub fn get_reward_rate_bps(env: Env) -> Result<u32, VaultError> {
         let _ = admin::get_admin(&env)?;
         Ok(balance::get_reward_rate_bps(&env))
+    }
+
+    /// Read-only: returns the current effective APR in basis points.
+    pub fn current_apr_bps(env: Env) -> u32 {
+        balance::get_reward_rate_bps(&env)
+    }
+
+    /// Read-only: returns time-weighted average APR over the last N ledgers.
+    /// Calculates the weighted average of rates based on how many ledgers each rate was active.
+    pub fn twap_apr_bps(env: Env, window_ledgers: u32) -> Result<u32, VaultError> {
+        let _ = admin::get_admin(&env)?;
+        
+        if window_ledgers == 0 {
+            return Ok(balance::get_reward_rate_bps(&env));
+        }
+
+        let current_ledger = env.ledger().sequence();
+        let start_ledger = if current_ledger > window_ledgers {
+            current_ledger - window_ledgers
+        } else {
+            0
+        };
+
+        let history = balance::get_rate_history(&env);
+        let current_rate = balance::get_reward_rate_bps(&env);
+
+        // If no history, return current rate (assume it's been constant)
+        if history.is_empty() {
+            return Ok(current_rate);
+        }
+
+        // Build timeline: history stores (ledger, old_rate) meaning at that ledger, rate changed from old_rate to new
+        // We need to reconstruct the rate timeline
+        let mut weighted_sum: u64 = 0;
+        let mut total_ledgers: u64 = window_ledgers as u64;
+        
+        // Find the rate that was active at start_ledger
+        // History is ordered chronologically (oldest first)
+        // We need to find the last history entry before or at start_ledger
+        let mut rate_at_start = 0u32;
+        let mut index = 0;
+        while index < history.len() {
+            let (hist_ledger, hist_rate) = history.get(index).unwrap();
+            if hist_ledger <= start_ledger {
+                rate_at_start = hist_rate;
+            } else {
+                break;
+            }
+            index += 1;
+        }
+
+        // Now iterate through history entries within the window
+        let mut last_ledger = start_ledger;
+        let mut last_rate = rate_at_start;
+
+        while index < history.len() {
+            let (hist_ledger, hist_rate) = history.get(index).unwrap();
+            if hist_ledger < current_ledger {
+                // hist_rate is the old rate that was active from last_ledger up to hist_ledger
+                let duration = hist_ledger - last_ledger;
+                weighted_sum += (duration as u64) * (hist_rate as u64);
+                last_ledger = hist_ledger;
+                last_rate = hist_rate;
+            } else {
+                break;
+            }
+            index += 1;
+        }
+
+        // Add final segment from last change to current ledger with current rate
+        let final_duration = current_ledger - last_ledger;
+        weighted_sum += (final_duration as u64) * (current_rate as u64);
+
+        // Calculate average
+        if total_ledgers == 0 {
+            Ok(current_rate)
+        } else {
+            Ok((weighted_sum / total_ledgers) as u32)
+        }
+    }
+
+    /// Read-only: returns full rate change history.
+    pub fn get_rate_history(env: Env) -> Result<Vec<(u32, u32)>, VaultError> {
+        let _ = admin::get_admin(&env)?;
+        Ok(balance::get_rate_history(&env))
     }
 
     /// Admin: fund the separate reward pool used by `claim`.

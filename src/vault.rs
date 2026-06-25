@@ -76,6 +76,20 @@ impl VaultContract {
         Self::do_unstake(&env, &staker, shares)
     }
 
+    /// Convenience function to fully exit a staking position in one call.
+    ///
+    /// Reads the caller's entire share balance and unstakes it, auto-claiming
+    /// any pending rewards first (same behaviour as `unstake`).
+    /// Returns the total token amount returned to the user.
+    /// Reverts with `PositionNotFound` when the user has no active position.
+    pub fn unstake_all(env: Env, user: Address) -> Result<i128, VaultError> {
+        let shares = balance::get_shares(&env, &user);
+        if shares == 0 {
+            return Err(VaultError::PositionNotFound);
+        }
+        Self::do_unstake(&env, &user, shares)
+    }
+
     /// Claim accumulated staking rewards without changing the staked position.
     ///
     /// Accrues any pending rewards up to the current ledger, then transfers the
@@ -764,8 +778,9 @@ impl VaultContract {
         while index < history.len() {
             let (hist_ledger, _) = history.get(index).unwrap();
             if hist_ledger < current_ledger {
+                // hist_rate is the old rate that was active from last_ledger up to hist_ledger
                 let duration = hist_ledger - last_ledger;
-                weighted_sum += (duration as u64) * (last_rate as u64);
+                weighted_sum += (duration as u64) * (hist_rate as u64);
                 last_ledger = hist_ledger;
                 index += 1;
                 // Rate active from hist_ledger = old_rate of next entry, or current_rate.
@@ -867,29 +882,40 @@ impl VaultContract {
         ))
     }
 
-    // --- Total claimable (Issue #95) ---
-
-    /// Returns the sum of all pending rewards owed to active stakers at the current ledger.
+    /// Read-only query for the reward token balance held by the contract.
     ///
-    /// This is a read-only approximation — rewards keep accruing after the query returns.
-    /// Supports up to 200 registered stakers. Reverts with `TooManyStakers` beyond that
-    /// limit to prevent compute overflow. No auth required.
-    pub fn get_total_claimable(env: Env) -> Result<i128, VaultError> {
-        let _ = admin::get_admin(&env)?;
-        let all_stakers = balance::get_all_stakers(&env);
-        if all_stakers.len() > 200 {
-            return Err(VaultError::TooManyStakers);
+    /// Returns the current balance of the vault token in the contract's own
+    /// account. This covers both staked principal and the funded reward pool,
+    /// allowing integrators to assess whether the pool can sustain its current
+    /// reward rate before staking. No auth required.
+    pub fn reward_token_balance(env: Env) -> Result<i128, VaultError> {
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(VaultError::NotInitialized)?;
+        let token_client = token::Client::new(&env, &token_addr);
+        Ok(token_client.balance(&env.current_contract_address()))
+    }
+
+    /// Read-only query for how many ledgers ago a user opened their staking position.
+    ///
+    /// Returns `current_ledger - staked_at_ledger` for the user's position,
+    /// which is useful for frontends showing lock-up countdowns, boost tier
+    /// eligibility, and time-to-target estimates.
+    /// Reverts with `PositionNotFound` if the user has no active position.
+    /// No auth required.
+    pub fn position_age_ledgers(env: Env, user: Address) -> Result<u32, VaultError> {
+        let shares = balance::get_shares(&env, &user);
+        if shares == 0 {
+            return Err(VaultError::PositionNotFound);
         }
-        let mut total: i128 = 0;
-        let mut i = 0;
-        while i < all_stakers.len() {
-            let user = all_stakers.get(i).unwrap();
-            let raw = Self::pending_reward(&env, &user)?;
-            let normalized = Self::normalize_to_reward_decimals(&env, raw)?;
-            total = total.checked_add(normalized).ok_or(VaultError::ArithmeticError)?;
-            i += 1;
-        }
-        Ok(total)
+        let staked_at: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakedAtLedger(user))
+            .unwrap_or(0);
+        Ok(env.ledger().sequence().saturating_sub(staked_at))
     }
 
     // --- Pool statistics (#38) ---

@@ -32,4 +32,12 @@ pub enum VaultError {
     BatchTooLarge = 21,
     /// get_total_claimable was called when more than 200 stakers are registered.
     TooManyStakers = 22,
+    /// Recipient already has an active staking position.
+    RecipientAlreadyStaking = 23,
+    /// A boost campaign is already active; end it before starting a new one.
+    CampaignAlreadyActive = 24,
+    /// No boost campaign is currently active.
+    NoCampaignActive = 25,
+    /// Leaderboard size exceeds the maximum of 20.
+    LeaderboardSizeTooLarge = 26,
 }

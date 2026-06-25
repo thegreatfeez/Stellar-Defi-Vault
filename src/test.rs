@@ -9,6 +9,7 @@ use soroban_sdk::{
 
 use crate::{
     errors::VaultError,
+    storage::LeaderboardEntry,
     vault::{
         VaultContract, VaultContractClient, BOOST_BPS_BASE, CONTRACT_VERSION,
         STELLAR_LEDGERS_PER_YEAR,
@@ -1144,6 +1145,7 @@ fn test_pool_cap_updated_emits_event() {
     );
     let data = soroban_sdk::Vec::<soroban_sdk::Val>::try_from_val(&f.env, &event.2).unwrap();
     assert_eq!(i128::try_from_val(&f.env, &data.get(0).unwrap()).unwrap(), 1_000_000);
+    assert_eq!(f.vault.get_pool_cap(), 1_000_000);
 }
 
 #[test]
@@ -1544,6 +1546,600 @@ fn test_cap_zero_disables_limit() {
     assert!(window_opt.is_none(), "no window stored when cap is disabled");
 }
 
+// ── TWAP / rate history tests ─────────────────────────────────────────────────
+
+#[test]
+fn test_twap_single_rate_equals_current_rate() {
+    let f = VaultFixture::new();
+
+    f.vault.set_reward_rate_bps(&1500);
+    set_ledger(&f.env, 100);
+
+    let twap = f.vault.twap_apr_bps(&50);
+    assert_eq!(twap, 1500);
+
+    let twap = f.vault.twap_apr_bps(&100);
+    assert_eq!(twap, 1500);
+}
+
+#[test]
+fn test_twap_two_rates_calculated_correctly() {
+    let f = VaultFixture::new();
+
+    f.vault.set_reward_rate_bps(&1000);
+    set_ledger(&f.env, 100);
+
+    f.vault.set_reward_rate_bps(&2000);
+    set_ledger(&f.env, 200);
+
+    let twap = f.vault.twap_apr_bps(&100);
+    assert_eq!(twap, 2000);
+
+    f.vault.set_reward_rate_bps(&3000);
+    set_ledger(&f.env, 300);
+
+    let twap = f.vault.twap_apr_bps(&200);
+    assert_eq!(twap, 2500);
+}
+
+#[test]
+fn test_twap_with_window_starting_before_first_change() {
+    let f = VaultFixture::new();
+
+    set_ledger(&f.env, 50);
+    f.vault.set_reward_rate_bps(&1000);
+    set_ledger(&f.env, 100);
+    f.vault.set_reward_rate_bps(&2000);
+    set_ledger(&f.env, 200);
+
+    let twap = f.vault.twap_apr_bps(&150);
+    assert_eq!(twap, 1666);
+}
+
+#[test]
+fn test_rate_history_capped_at_50_entries() {
+    let f = VaultFixture::new();
+
+    f.vault.set_reward_rate_bps(&1000);
+
+    for i in 1..=60 {
+        set_ledger(&f.env, i * 10);
+        f.vault.set_reward_rate_bps(&(1000 + i as u32));
+    }
+
+    set_ledger(&f.env, 650);
+
+    let history = f.vault.get_rate_history();
+    assert_eq!(history.len(), 50);
+
+    let first_entry = history.get(0).unwrap();
+    assert!(first_entry.0 > 10);
+}
+
+#[test]
+fn test_get_rate_history_returns_full_history() {
+    let f = VaultFixture::new();
+
+    f.vault.set_reward_rate_bps(&1000);
+    set_ledger(&f.env, 100);
+    f.vault.set_reward_rate_bps(&2000);
+    set_ledger(&f.env, 200);
+    f.vault.set_reward_rate_bps(&3000);
+
+    let history = f.vault.get_rate_history();
+    assert_eq!(history.len(), 3);
+
+    let entry1 = history.get(0).unwrap();
+    assert_eq!(entry1.0, 0);
+    assert_eq!(entry1.1, 0);
+
+    let entry2 = history.get(1).unwrap();
+    assert_eq!(entry2.0, 100);
+    assert_eq!(entry2.1, 1000);
+
+    let entry3 = history.get(2).unwrap();
+    assert_eq!(entry3.0, 200);
+    assert_eq!(entry3.1, 2000);
+}
+
+#[test]
+fn test_twap_zero_window_returns_current_rate() {
+    let f = VaultFixture::new();
+
+    f.vault.set_reward_rate_bps(&1500);
+
+    let twap = f.vault.twap_apr_bps(&0);
+    assert_eq!(twap, 1500);
+}
+
+// ── Issue #49: ledgers_to_target / days_to_target ─────────────────────────────
+
+#[test]
+fn test_ledgers_to_target_target_already_met_returns_zero() {
+    let f = VaultFixture::new();
+    let annual = STELLAR_LEDGERS_PER_YEAR as i128;
+
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+    f.vault.stake(&f.alice, &annual);
+
+    // Advance so Alice has 100 pending rewards
+    set_ledger(&f.env, 100);
+    // Target is less than or equal to pending → should return 0
+    assert_eq!(f.vault.ledgers_to_target(&f.alice, &1), 0);
+    assert_eq!(f.vault.ledgers_to_target(&f.alice, &99), 0);
+    assert_eq!(f.vault.ledgers_to_target(&f.alice, &100), 0);
+}
+
+#[test]
+fn test_ledgers_to_target_no_position_returns_max() {
+    let f = VaultFixture::new();
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+    assert_eq!(f.vault.ledgers_to_target(&f.alice, &1000), u32::MAX);
+}
+
+#[test]
+fn test_ledgers_to_target_zero_rate_returns_max() {
+    let f = VaultFixture::new();
+    f.vault.stake(&f.alice, &1_000_000);
+    assert_eq!(f.vault.ledgers_to_target(&f.alice, &500), u32::MAX);
+}
+
+#[test]
+fn test_ledgers_to_target_known_input() {
+    let f = VaultFixture::new();
+    let annual = STELLAR_LEDGERS_PER_YEAR as i128;
+
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+    f.vault.stake(&f.alice, &annual);
+
+    let ledgers = f.vault.ledgers_to_target(&f.alice, &100);
+    assert_eq!(ledgers, 100);
+}
+
+#[test]
+fn test_days_to_target_sentinel_for_max_ledgers() {
+    let f = VaultFixture::new();
+    assert_eq!(f.vault.days_to_target(&f.alice, &1000), u32::MAX);
+}
+
+#[test]
+fn test_days_to_target_converts_ledgers_correctly() {
+    let f = VaultFixture::new();
+    let annual = STELLAR_LEDGERS_PER_YEAR as i128;
+
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+    f.vault.stake(&f.alice, &annual);
+
+    let days = f.vault.days_to_target(&f.alice, &100);
+    assert_eq!(days, 1);
+
+    let days = f.vault.days_to_target(&f.alice, &17280);
+    assert_eq!(days, 1);
+
+    let days = f.vault.days_to_target(&f.alice, &17281);
+    assert_eq!(days, 2);
+}
+
+// ── Issue #48: Boost Campaign ─────────────────────────────────────────────────
+
+#[test]
+fn test_start_boost_campaign_activates() {
+    let f = VaultFixture::new();
+    set_ledger(&f.env, 10);
+
+    f.vault.start_boost_campaign(&20_000, &100);
+
+    let campaign = f.vault.active_campaign();
+    assert!(campaign.is_some());
+    let (mult, ends) = campaign.unwrap();
+    assert_eq!(mult, 20_000);
+    assert_eq!(ends, 110); // 10 + 100
+}
+
+#[test]
+fn test_active_campaign_returns_none_when_none() {
+    let f = VaultFixture::new();
+    let campaign = f.vault.active_campaign();
+    assert!(campaign.is_none());
+}
+
+#[test]
+fn test_active_campaign_returns_none_after_expiry() {
+    let f = VaultFixture::new();
+    set_ledger(&f.env, 0);
+    f.vault.start_boost_campaign(&20_000, &50);
+
+    set_ledger(&f.env, 51);
+    let campaign = f.vault.active_campaign();
+    assert!(campaign.is_none());
+}
+
+#[test]
+fn test_second_campaign_rejected_while_first_active() {
+    let f = VaultFixture::new();
+    f.vault.start_boost_campaign(&15_000, &200);
+
+    let result = f.vault.try_start_boost_campaign(&20_000, &100);
+    assert_eq!(result, Err(Ok(VaultError::CampaignAlreadyActive)));
+}
+
+#[test]
+fn test_end_boost_campaign_cancels_early() {
+    let f = VaultFixture::new();
+    f.vault.start_boost_campaign(&20_000, &500);
+
+    f.vault.end_boost_campaign();
+
+    let campaign = f.vault.active_campaign();
+    assert!(campaign.is_none());
+}
+
+#[test]
+fn test_end_boost_campaign_when_none_active_fails() {
+    let f = VaultFixture::new();
+    let result = f.vault.try_end_boost_campaign();
+    assert_eq!(result, Err(Ok(VaultError::NoCampaignActive)));
+}
+
+#[test]
+fn test_campaign_boosts_rewards_during_window() {
+    let f = VaultFixture::new();
+    let annual = STELLAR_LEDGERS_PER_YEAR as i128;
+
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE); // 100% APR → 1 token/ledger baseline
+    f.vault.stake(&f.alice, &annual);
+
+    set_ledger(&f.env, 1);
+    // Start a 2x campaign for 10 ledgers
+    f.vault.start_boost_campaign(&20_000, &10);
+
+    // At ledger 11: 1 base ledger (0→1) + 10 campaign 2x ledgers (1→11) = 1 + 20 = 21
+    set_ledger(&f.env, 11);
+    let pending = f.vault.calc_pending_reward(&f.alice);
+    assert_eq!(pending, 21);
+}
+
+#[test]
+fn test_campaign_reverts_to_base_rate_after_expiry() {
+    let f = VaultFixture::new();
+    let annual = STELLAR_LEDGERS_PER_YEAR as i128;
+
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+    f.vault.stake(&f.alice, &annual);
+
+    // Campaign: 2x for 10 ledgers (ledgers 0..10)
+    f.vault.start_boost_campaign(&20_000, &10);
+
+    // At ledger 20: 10 campaign ledgers (2 each) + 10 base ledgers (1 each) = 30
+    set_ledger(&f.env, 20);
+    let pending = f.vault.calc_pending_reward(&f.alice);
+    assert_eq!(pending, 30);
+}
+
+#[test]
+fn test_campaign_time_weighted_claim_across_boundary() {
+    let f = VaultFixture::new();
+    let annual = STELLAR_LEDGERS_PER_YEAR as i128;
+
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+    f.vault.stake(&f.alice, &annual);
+
+    // Campaign starts at ledger 5, runs for 10 ledgers (ends at 15)
+    set_ledger(&f.env, 5);
+    f.vault.start_boost_campaign(&20_000, &10);
+
+    // At ledger 20:
+    // ledgers 0-5 (before campaign): 5 * 1 = 5
+    // ledgers 5-15 (campaign, 2x): 10 * 2 = 20
+    // ledgers 15-20 (after campaign): 5 * 1 = 5
+    // total = 30
+    set_ledger(&f.env, 20);
+    let pending = f.vault.calc_pending_reward(&f.alice);
+    assert_eq!(pending, 30);
+}
+
+#[test]
+fn test_campaign_emits_started_event() {
+    let f = VaultFixture::new();
+    f.vault.start_boost_campaign(&15_000, &100);
+
+    let events = f.env.events().all();
+    let camp_events: std::vec::Vec<_> = events
+        .into_iter()
+        .filter(|(_, topics, _)| topic_matches(&f.env, topics, "camp_on"))
+        .collect();
+    assert_eq!(camp_events.len(), 1);
+}
+
+#[test]
+fn test_campaign_emits_ended_event() {
+    let f = VaultFixture::new();
+    f.vault.start_boost_campaign(&15_000, &100);
+    f.vault.end_boost_campaign();
+
+    let events = f.env.events().all();
+    let camp_events: std::vec::Vec<_> = events
+        .into_iter()
+        .filter(|(_, topics, _)| topic_matches(&f.env, topics, "camp_off"))
+        .collect();
+    assert_eq!(camp_events.len(), 1);
+}
+
+#[test]
+fn test_start_campaign_after_expiry_succeeds() {
+    let f = VaultFixture::new();
+    f.vault.start_boost_campaign(&15_000, &10);
+
+    // Advance past expiry, then start a new one
+    set_ledger(&f.env, 11);
+    f.vault.start_boost_campaign(&20_000, &50);
+
+    let campaign = f.vault.active_campaign();
+    assert!(campaign.is_some());
+    assert_eq!(campaign.unwrap().0, 20_000);
+}
+
+// ── Issue #43: transfer_position ─────────────────────────────────────────────
+
+#[test]
+fn test_transfer_position_success() {
+    let f = VaultFixture::new();
+    f.vault.stake(&f.alice, &500_000);
+
+    f.vault.transfer_position(&f.alice, &f.bob);
+
+    assert_eq!(f.vault.shares_of(&f.alice), 0);
+    assert_eq!(f.vault.shares_of(&f.bob), 500_000);
+}
+
+#[test]
+fn test_transfer_position_no_position_fails() {
+    let f = VaultFixture::new();
+    // Alice has nothing staked
+    let result = f.vault.try_transfer_position(&f.alice, &f.bob);
+    assert_eq!(result, Err(Ok(VaultError::PositionNotFound)));
+}
+
+#[test]
+fn test_transfer_position_recipient_already_staking_fails() {
+    let f = VaultFixture::new();
+    f.vault.stake(&f.alice, &500_000);
+    f.vault.stake(&f.bob, &100_000);
+
+    let result = f.vault.try_transfer_position(&f.alice, &f.bob);
+    assert_eq!(result, Err(Ok(VaultError::RecipientAlreadyStaking)));
+}
+
+#[test]
+fn test_transfer_position_settles_pending_rewards() {
+    let f = VaultFixture::new();
+    let annual = STELLAR_LEDGERS_PER_YEAR as i128;
+
+    f.token_admin.mint(&f.admin, &(annual * 2));
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+    f.vault.fund_reward_pool(&f.admin, &(annual * 2));
+    f.vault.stake(&f.alice, &annual);
+
+    // Advance 100 ledgers so Alice accumulates rewards
+    set_ledger(&f.env, 100);
+
+    // Transfer position — pending rewards should be settled to Alice's accrued balance
+    f.vault.transfer_position(&f.alice, &f.bob);
+
+    // Alice should still be able to claim her accrued rewards (shares = 0 but accrued > 0)
+    let claimed = f.vault.claim(&f.alice);
+    assert_eq!(claimed, 100);
+}
+
+#[test]
+fn test_transfer_position_lock_carries_over() {
+    let f = VaultFixture::new();
+    set_ledger(&f.env, 50);
+    f.vault.stake(&f.alice, &500_000);
+
+    // Record Alice's staked_at
+    let alice_pos = f.vault.position_of(&f.alice).unwrap();
+    assert_eq!(alice_pos.staked_at_ledger, 50);
+
+    set_ledger(&f.env, 60);
+    f.vault.transfer_position(&f.alice, &f.bob);
+
+    let bob_pos = f.vault.position_of(&f.bob).unwrap();
+    assert_eq!(bob_pos.staked_at_ledger, 50);
+}
+
+#[test]
+fn test_transfer_position_recipient_starts_fresh_accrual() {
+    let f = VaultFixture::new();
+    let annual = STELLAR_LEDGERS_PER_YEAR as i128;
+
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+    f.vault.stake(&f.alice, &annual);
+
+    set_ledger(&f.env, 100);
+    f.vault.transfer_position(&f.alice, &f.bob);
+
+    // Bob just received the position — pending should be 0 (fresh start)
+    assert_eq!(f.vault.calc_pending_reward(&f.bob), 0);
+
+    // After 50 more ledgers, Bob should have accrued 50 tokens
+    set_ledger(&f.env, 150);
+    assert_eq!(f.vault.calc_pending_reward(&f.bob), 50);
+}
+
+#[test]
+fn test_transfer_position_emits_event() {
+    let f = VaultFixture::new();
+    f.vault.stake(&f.alice, &500_000);
+    f.vault.transfer_position(&f.alice, &f.bob);
+
+    let events = f.env.events().all();
+    let xfer_events: std::vec::Vec<_> = events
+        .into_iter()
+        .filter(|(_, topics, _)| topic_matches(&f.env, topics, "pos_xfer"))
+        .collect();
+    assert_eq!(xfer_events.len(), 1);
+}
+
+#[test]
+fn test_transfer_position_total_shares_unchanged() {
+    let f = VaultFixture::new();
+    f.vault.stake(&f.alice, &500_000);
+
+    let (total_before, deposited_before) = f.vault.vault_state();
+    f.vault.transfer_position(&f.alice, &f.bob);
+    let (total_after, deposited_after) = f.vault.vault_state();
+
+    assert_eq!(total_before, total_after);
+    assert_eq!(deposited_before, deposited_after);
+}
+
+#[test]
+fn test_transfer_position_paused_fails() {
+    let f = VaultFixture::new();
+    f.vault.stake(&f.alice, &500_000);
+    f.vault.pause();
+
+    let result = f.vault.try_transfer_position(&f.alice, &f.bob);
+    assert_eq!(result, Err(Ok(VaultError::VaultPaused)));
+}
+
+// ── Issue #46: Leaderboard ────────────────────────────────────────────────────
+
+#[test]
+fn test_leaderboard_empty_by_default() {
+    let f = VaultFixture::new();
+    f.vault.set_leaderboard_size(&10);
+    let board = f.vault.get_leaderboard();
+    assert_eq!(board.len(), 0);
+}
+
+#[test]
+fn test_leaderboard_size_too_large_fails() {
+    let f = VaultFixture::new();
+    let result = f.vault.try_set_leaderboard_size(&21);
+    assert_eq!(result, Err(Ok(VaultError::LeaderboardSizeTooLarge)));
+}
+
+#[test]
+fn test_leaderboard_top_staker_appears_first() {
+    let f = VaultFixture::new();
+    f.vault.set_leaderboard_size(&10);
+
+    f.vault.stake(&f.alice, &100_000);
+    f.vault.stake(&f.bob, &500_000);
+
+    let board = f.vault.get_leaderboard();
+    assert_eq!(board.len(), 2);
+    // Bob staked more, should appear first
+    assert_eq!(board.get(0).unwrap().staker, f.bob);
+    assert_eq!(board.get(1).unwrap().staker, f.alice);
+}
+
+#[test]
+fn test_leaderboard_unstaking_drops_user() {
+    let f = VaultFixture::new();
+    f.vault.set_leaderboard_size(&10);
+
+    f.vault.stake(&f.alice, &300_000);
+    f.vault.stake(&f.bob, &200_000);
+
+    // Alice fully unstakes
+    let alice_shares = f.vault.shares_of(&f.alice);
+    f.vault.unstake(&f.alice, &alice_shares);
+
+    let board = f.vault.get_leaderboard();
+    assert_eq!(board.len(), 1);
+    assert_eq!(board.get(0).unwrap().staker, f.bob);
+}
+
+#[test]
+fn test_leaderboard_respects_size_limit() {
+    let f = VaultFixture::new();
+    f.vault.set_leaderboard_size(&1);
+
+    f.vault.stake(&f.alice, &100_000);
+    f.vault.stake(&f.bob, &500_000); // larger — displaces Alice
+
+    let board = f.vault.get_leaderboard();
+    assert_eq!(board.len(), 1);
+    assert_eq!(board.get(0).unwrap().staker, f.bob);
+}
+
+#[test]
+fn test_leaderboard_small_staker_not_added_when_full() {
+    let f = VaultFixture::new();
+    f.vault.set_leaderboard_size(&1);
+
+    f.vault.stake(&f.bob, &500_000);
+    f.vault.stake(&f.alice, &100_000); // smaller, should not appear
+
+    let board = f.vault.get_leaderboard();
+    assert_eq!(board.len(), 1);
+    assert_eq!(board.get(0).unwrap().staker, f.bob);
+}
+
+#[test]
+fn test_leaderboard_updates_on_additional_stake() {
+    let f = VaultFixture::new();
+    f.vault.set_leaderboard_size(&10);
+
+    f.vault.stake(&f.bob, &500_000);
+    f.vault.stake(&f.alice, &100_000);
+
+    // Alice stakes more to surpass Bob
+    f.vault.stake(&f.alice, &1_000_000);
+
+    let board = f.vault.get_leaderboard();
+    assert_eq!(board.len(), 2);
+    assert_eq!(board.get(0).unwrap().staker, f.alice);
+}
+
+#[test]
+fn test_leaderboard_disabled_when_size_zero() {
+    let f = VaultFixture::new();
+    // No set_leaderboard_size call → size defaults to 0 → tracking disabled
+
+    f.vault.stake(&f.alice, &500_000);
+    f.vault.stake(&f.bob, &100_000);
+
+    // get_leaderboard always returns the stored vec (empty when disabled)
+    let board = f.vault.get_leaderboard();
+    assert_eq!(board.len(), 0);
+}
+
+#[test]
+fn test_leaderboard_trim_on_size_reduction() {
+    let f = VaultFixture::new();
+    f.vault.set_leaderboard_size(&5);
+
+    f.vault.stake(&f.alice, &500_000);
+    f.vault.stake(&f.bob, &300_000);
+
+    let board = f.vault.get_leaderboard();
+    assert_eq!(board.len(), 2);
+
+    // Reduce size to 1 — should trim to top staker only
+    f.vault.set_leaderboard_size(&1);
+
+    let board = f.vault.get_leaderboard();
+    assert_eq!(board.len(), 1);
+    assert_eq!(board.get(0).unwrap().staker, f.alice);
+}
+
+#[test]
+fn test_leaderboard_amounts_are_correct() {
+    let f = VaultFixture::new();
+    f.vault.set_leaderboard_size(&10);
+
+    f.vault.stake(&f.alice, &400_000);
+    f.vault.stake(&f.bob, &200_000);
+
+    let board = f.vault.get_leaderboard();
+    assert_eq!(board.get(0).unwrap().amount, 400_000);
+    assert_eq!(board.get(1).unwrap().amount, 200_000);
+}
+
 // ── Issue #83: pool_initialized event ────────────────────────────────────────
 
 #[test]
@@ -1754,6 +2350,7 @@ fn test_get_total_claimable_zero_stakers_returns_zero() {
     let total = f.vault.get_total_claimable();
     assert_eq!(total, 0);
 }
+
 
 
 

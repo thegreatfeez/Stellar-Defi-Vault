@@ -2,7 +2,7 @@ use soroban_sdk::{contract, contractimpl, token, Address, Env, String, Vec};
 
 use crate::{
     admin, balance, errors::VaultError, events,
-    storage::{ClaimWindow, DataKey, PoolConfig, PoolStats, StakePosition, UnbondingPosition, UserStats},
+    storage::{CampaignInfo, ClaimWindow, DataKey, LeaderboardEntry, PoolConfig, PoolStats, StakePosition, UnbondingPosition, UserStats},
 };
 
 pub(crate) const CONTRACT_VERSION: &str = "0.1.0";
@@ -439,6 +439,7 @@ impl VaultContract {
             events::position_closed(&env, &user);
         }
         Self::record_stake_snapshot(&env, &user, new_user_shares);
+        Self::update_leaderboard(&env, &user, new_user_shares);
 
         // store or merge unbonding position; restart cooldown from now
         let current_ledger = env.ledger().sequence();
@@ -736,37 +737,47 @@ impl VaultContract {
         let mut weighted_sum: u64 = 0;
         let mut total_ledgers: u64 = window_ledgers as u64;
         
-        // Find the rate that was active at start_ledger
-        // History is ordered chronologically (oldest first)
-        // We need to find the last history entry before or at start_ledger
-        let mut rate_at_start = 0u32;
-        let mut index = 0;
+        // Each history entry (L, old_rate) means "at L, rate changed FROM old_rate".
+        // The rate active FROM ledger L is the old_rate of the NEXT entry, or current_rate if last.
+        // Find the first entry strictly after start_ledger.
+        let mut index: u32 = 0;
         while index < history.len() {
-            let (hist_ledger, hist_rate) = history.get(index).unwrap();
+            let (hist_ledger, _) = history.get(index).unwrap();
             if hist_ledger <= start_ledger {
-                rate_at_start = hist_rate;
+                index += 1;
             } else {
                 break;
             }
-            index += 1;
         }
+        // Rate at start_ledger = old_rate of the first entry after start, or current_rate.
+        let rate_at_start = if index < history.len() {
+            let (_, next_old_rate) = history.get(index).unwrap();
+            next_old_rate
+        } else {
+            current_rate
+        };
 
-        // Now iterate through history entries within the window
+        // Iterate through history entries within the window.
         let mut last_ledger = start_ledger;
         let mut last_rate = rate_at_start;
 
         while index < history.len() {
-            let (hist_ledger, hist_rate) = history.get(index).unwrap();
+            let (hist_ledger, _) = history.get(index).unwrap();
             if hist_ledger < current_ledger {
-                // Rate was last_rate from last_ledger to hist_ledger
                 let duration = hist_ledger - last_ledger;
                 weighted_sum += (duration as u64) * (last_rate as u64);
                 last_ledger = hist_ledger;
-                last_rate = hist_rate;
+                index += 1;
+                // Rate active from hist_ledger = old_rate of next entry, or current_rate.
+                last_rate = if index < history.len() {
+                    let (_, next_old_rate) = history.get(index).unwrap();
+                    next_old_rate
+                } else {
+                    current_rate
+                };
             } else {
                 break;
             }
-            index += 1;
         }
 
         // Add final segment from last change to current ledger with current rate
@@ -1038,6 +1049,7 @@ impl VaultContract {
             events::position_opened(&env, &beneficiary, amount);
         }
         Self::record_stake_snapshot(&env, &beneficiary, new_shares);
+        Self::update_leaderboard(&env, &beneficiary, new_shares);
 
         events::deposit(&env, &beneficiary, amount, shares);
 
@@ -1117,6 +1129,7 @@ impl VaultContract {
             events::position_closed(&env, &user);
         }
         Self::record_stake_snapshot(&env, &user, new_user_shares);
+        Self::update_leaderboard(&env, &user, new_user_shares);
 
         // Reward forfeiture: clear accrued rewards and advance checkpoint so no further claim for pre-slash accrual
         balance::set_accrued_reward(&env, &user, 0);
@@ -1134,6 +1147,312 @@ impl VaultContract {
         Ok(actual)
     }
 
+    // --- Time-to-target queries (#49) ---
+
+    /// Read-only estimate of ledgers remaining until `user` accumulates `target_reward` tokens.
+    ///
+    /// # Formula
+    /// `ledgers = ceil(remaining * BOOST_BPS_BASE * STELLAR_LEDGERS_PER_YEAR / (position_amount * boosted_rate_bps))`
+    /// where `boosted_rate_bps = rate_bps * tier_mult / 10000 * campaign_mult / 10000`.
+    ///
+    /// Returns 0 if pending reward already meets or exceeds target.
+    /// Returns `u32::MAX` if user has no active position, rate is 0, or effective rate rounds to 0.
+    pub fn ledgers_to_target(
+        env: Env,
+        user: Address,
+        target_reward: i128,
+    ) -> Result<u32, VaultError> {
+        let _ = admin::get_admin(&env)?;
+        let pending = Self::pending_reward(&env, &user)?;
+        if pending >= target_reward {
+            return Ok(0);
+        }
+
+        let shares = balance::get_shares(&env, &user);
+        if shares == 0 {
+            return Ok(u32::MAX);
+        }
+
+        let rate_bps = balance::get_reward_rate_bps(&env);
+        if rate_bps == 0 {
+            return Ok(u32::MAX);
+        }
+
+        let current_ledger = env.ledger().sequence();
+        let tier_mult = Self::boost_multiplier_for_ledger(&env, &user, current_ledger);
+
+        let campaign_mult: u32 = match env
+            .storage()
+            .instance()
+            .get::<_, CampaignInfo>(&DataKey::BoostCampaign)
+        {
+            Some(c)
+                if current_ledger >= c.starts_at_ledger && current_ledger < c.ends_at_ledger =>
+            {
+                c.multiplier_bps
+            }
+            _ => BOOST_BPS_BASE,
+        };
+
+        // Match the integer-division order used in reward_for_ledgers
+        let effective_rate = (rate_bps as i128)
+            .checked_mul(tier_mult as i128)
+            .ok_or(VaultError::ArithmeticError)?
+            .checked_div(BOOST_BPS_BASE as i128)
+            .ok_or(VaultError::ArithmeticError)?;
+        let boosted_rate = effective_rate
+            .checked_mul(campaign_mult as i128)
+            .ok_or(VaultError::ArithmeticError)?
+            .checked_div(BOOST_BPS_BASE as i128)
+            .ok_or(VaultError::ArithmeticError)?;
+
+        if boosted_rate == 0 {
+            return Ok(u32::MAX);
+        }
+
+        let total_shares = balance::get_total_shares(&env);
+        let total_deposited = balance::get_total_deposited(&env);
+        let user_amount = balance::shares_to_amount(total_shares, total_deposited, shares)
+            .ok_or(VaultError::ArithmeticError)?;
+        if user_amount == 0 {
+            return Ok(u32::MAX);
+        }
+
+        let denominator = user_amount
+            .checked_mul(boosted_rate)
+            .ok_or(VaultError::ArithmeticError)?;
+
+        let remaining = target_reward - pending;
+        let numerator = remaining
+            .checked_mul(BOOST_BPS_BASE as i128)
+            .ok_or(VaultError::ArithmeticError)?
+            .checked_mul(STELLAR_LEDGERS_PER_YEAR as i128)
+            .ok_or(VaultError::ArithmeticError)?;
+
+        // Ceiling division
+        let ledgers = numerator
+            .checked_add(denominator - 1)
+            .ok_or(VaultError::ArithmeticError)?
+            .checked_div(denominator)
+            .ok_or(VaultError::ArithmeticError)?;
+
+        Ok(if ledgers > u32::MAX as i128 { u32::MAX } else { ledgers as u32 })
+    }
+
+    /// Read-only estimate of days remaining until `user` accumulates `target_reward` tokens.
+    ///
+    /// Uses 5 seconds per ledger (Stellar's approximate close time) and 86 400 seconds per day.
+    /// Returns `u32::MAX` when `ledgers_to_target` returns `u32::MAX`.
+    pub fn days_to_target(
+        env: Env,
+        user: Address,
+        target_reward: i128,
+    ) -> Result<u32, VaultError> {
+        let ledgers = Self::ledgers_to_target(env, user, target_reward)?;
+        if ledgers == u32::MAX {
+            return Ok(u32::MAX);
+        }
+        // ceil(ledgers * 5 / 86400) — 5 s/ledger, 86400 s/day
+        let days = ((ledgers as u64) * 5 + 86399) / 86400;
+        Ok(days.min(u32::MAX as u64) as u32)
+    }
+
+    // --- Boost campaign (#48) ---
+
+    /// Admin: activate a time-limited reward boost for all stakers.
+    ///
+    /// The campaign `multiplier_bps` stacks with per-user tier multipliers.
+    /// Only one campaign may be active at a time — call `end_boost_campaign` first if one is running.
+    pub fn start_boost_campaign(
+        env: Env,
+        multiplier_bps: u32,
+        duration_ledgers: u32,
+    ) -> Result<(), VaultError> {
+        admin::require_admin(&env)?;
+
+        if multiplier_bps < BOOST_BPS_BASE {
+            return Err(VaultError::InvalidBoostSchedule);
+        }
+        if duration_ledgers == 0 {
+            return Err(VaultError::ZeroAmount);
+        }
+
+        let current_ledger = env.ledger().sequence();
+
+        if let Some(existing) = env
+            .storage()
+            .instance()
+            .get::<_, CampaignInfo>(&DataKey::BoostCampaign)
+        {
+            if current_ledger < existing.ends_at_ledger {
+                return Err(VaultError::CampaignAlreadyActive);
+            }
+        }
+
+        let ends_at_ledger = current_ledger.saturating_add(duration_ledgers);
+        env.storage().instance().set(
+            &DataKey::BoostCampaign,
+            &CampaignInfo {
+                multiplier_bps,
+                starts_at_ledger: current_ledger,
+                ends_at_ledger,
+            },
+        );
+
+        let admin = admin::get_admin(&env)?;
+        events::campaign_started(&env, &admin, multiplier_bps, ends_at_ledger);
+        Ok(())
+    }
+
+    /// Admin: cancel the active boost campaign early.
+    pub fn end_boost_campaign(env: Env) -> Result<(), VaultError> {
+        admin::require_admin(&env)?;
+
+        if !env.storage().instance().has(&DataKey::BoostCampaign) {
+            return Err(VaultError::NoCampaignActive);
+        }
+
+        env.storage().instance().remove(&DataKey::BoostCampaign);
+
+        let admin = admin::get_admin(&env)?;
+        events::campaign_ended(&env, &admin);
+        Ok(())
+    }
+
+    /// Read-only: returns `(multiplier_bps, ends_at_ledger)` if a boost campaign is currently active.
+    pub fn active_campaign(env: Env) -> Result<Option<(u32, u32)>, VaultError> {
+        let _ = admin::get_admin(&env)?;
+        let current_ledger = env.ledger().sequence();
+        let result = match env
+            .storage()
+            .instance()
+            .get::<_, CampaignInfo>(&DataKey::BoostCampaign)
+        {
+            Some(c)
+                if current_ledger >= c.starts_at_ledger && current_ledger < c.ends_at_ledger =>
+            {
+                Some((c.multiplier_bps, c.ends_at_ledger))
+            }
+            _ => None,
+        };
+        Ok(result)
+    }
+
+    // --- Position transfer (#43) ---
+
+    /// Transfer the caller's full staking position to `to`.
+    ///
+    /// Pending rewards are settled into `from`'s accrued balance before the transfer and remain
+    /// claimable by `from` via `claim`. The recipient inherits the lock-up timer (`staked_at_ledger`)
+    /// but starts fresh on reward accrual. Recipient must have no active staking position.
+    pub fn transfer_position(env: Env, from: Address, to: Address) -> Result<(), VaultError> {
+        from.require_auth();
+        Self::require_not_paused(&env)?;
+
+        let from_shares = balance::get_shares(&env, &from);
+        if from_shares == 0 {
+            return Err(VaultError::PositionNotFound);
+        }
+
+        let to_shares = balance::get_shares(&env, &to);
+        if to_shares > 0 {
+            return Err(VaultError::RecipientAlreadyStaking);
+        }
+
+        let total_shares = balance::get_total_shares(&env);
+        let total_deposited = balance::get_total_deposited(&env);
+        let position_amount =
+            balance::shares_to_amount(total_shares, total_deposited, from_shares)
+                .ok_or(VaultError::ArithmeticError)?;
+
+        // Settle pending rewards so `from` can still claim them after the transfer
+        Self::accrue_rewards(&env, &from, from_shares)?;
+
+        let current_ledger = env.ledger().sequence();
+
+        // Transfer shares
+        balance::set_shares(&env, &to, from_shares);
+        balance::set_shares(&env, &from, 0);
+
+        // Copy lock-up timer to recipient (lock status is inherited)
+        let staked_at: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakedAtLedger(from.clone()))
+            .unwrap_or(current_ledger);
+        env.storage()
+            .persistent()
+            .set(&DataKey::StakedAtLedger(to.clone()), &staked_at);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::StakedAtLedger(from.clone()));
+
+        // Recipient starts fresh on reward accrual
+        balance::set_reward_checkpoint_ledger(&env, &to, current_ledger);
+        balance::set_last_claim_ledger(&env, &to, current_ledger);
+        balance::set_accrued_reward(&env, &to, 0);
+
+        // Advance sender's checkpoint so no further rewards accrue on the transferred shares
+        balance::set_reward_checkpoint_ledger(&env, &from, current_ledger);
+
+        // total_shares and total_deposited are unchanged — same tokens, different owner
+        // total_stakers is also unchanged — one exits (from), one enters (to)
+
+        // Update governance snapshots for both parties
+        Self::record_stake_snapshot(&env, &from, 0);
+        Self::record_stake_snapshot(&env, &to, from_shares);
+
+        // Update leaderboard for both parties
+        Self::update_leaderboard(&env, &from, 0);
+        Self::update_leaderboard(&env, &to, from_shares);
+
+        events::position_transferred(&env, &from, &to, position_amount);
+        Ok(())
+    }
+
+    // --- Leaderboard (#46) ---
+
+    /// Admin: set the maximum number of entries tracked in the staking leaderboard (max 20).
+    ///
+    /// Setting `n` to 0 disables leaderboard tracking. Existing entries are trimmed if the
+    /// new size is smaller than the current leaderboard length.
+    pub fn set_leaderboard_size(env: Env, n: u32) -> Result<(), VaultError> {
+        admin::require_admin(&env)?;
+        if n > 20 {
+            return Err(VaultError::LeaderboardSizeTooLarge);
+        }
+        env.storage().instance().set(&DataKey::LeaderboardSize, &n);
+
+        // Trim existing leaderboard to new size if necessary
+        if n > 0 {
+            let board: Vec<LeaderboardEntry> = env
+                .storage()
+                .instance()
+                .get(&DataKey::Leaderboard)
+                .unwrap_or(Vec::new(&env));
+            if board.len() as u32 > n {
+                let mut trimmed: Vec<LeaderboardEntry> = Vec::new(&env);
+                let mut i = 0u32;
+                while i < n {
+                    trimmed.push_back(board.get(i).unwrap());
+                    i += 1;
+                }
+                env.storage().instance().set(&DataKey::Leaderboard, &trimmed);
+            }
+        }
+        Ok(())
+    }
+
+    /// Read-only: returns the current top stakers sorted descending by position size.
+    pub fn get_leaderboard(env: Env) -> Result<Vec<LeaderboardEntry>, VaultError> {
+        let _ = admin::get_admin(&env)?;
+        Ok(env
+            .storage()
+            .instance()
+            .get(&DataKey::Leaderboard)
+            .unwrap_or(Vec::new(&env)))
+    }
+
     // --- Simulation functions (Issue #54) ---
 
     /// Simulate the reward for staking `amount` tokens for `ledgers` ledger sequences
@@ -1146,7 +1465,7 @@ impl VaultContract {
             return Ok(0);
         }
         let multiplier = BOOST_BPS_BASE;
-        Self::reward_for_ledgers(amount, rate_bps, multiplier, ledgers)
+        Self::reward_for_ledgers(amount, rate_bps, multiplier, BOOST_BPS_BASE, ledgers)
     }
 
     /// Simulate compounded rewards by claiming every `claim_interval` ledgers
@@ -1177,7 +1496,7 @@ impl VaultContract {
                 claim_interval
             };
             let reward =
-                Self::reward_for_ledgers(current_amount, rate_bps, multiplier, interval)?;
+                Self::reward_for_ledgers(current_amount, rate_bps, multiplier, BOOST_BPS_BASE, interval)?;
             total_reward = total_reward
                 .checked_add(reward)
                 .ok_or(VaultError::ArithmeticError)?;
@@ -1204,7 +1523,7 @@ impl VaultContract {
             return Ok((0, 0));
         }
 
-        let base_reward = Self::reward_for_ledgers(amount, rate_bps, BOOST_BPS_BASE, ledgers)?;
+        let base_reward = Self::reward_for_ledgers(amount, rate_bps, BOOST_BPS_BASE, BOOST_BPS_BASE, ledgers)?;
 
         let schedule = balance::get_boost_schedule(&env).unwrap_or(Vec::new(&env));
         let mut boosted_reward: i128 = 0;
@@ -1224,7 +1543,7 @@ impl VaultContract {
             }
             let segment = tier_ledger - cursor;
             let segment_reward =
-                Self::reward_for_ledgers(amount, rate_bps, current_multiplier, segment)?;
+                Self::reward_for_ledgers(amount, rate_bps, current_multiplier, BOOST_BPS_BASE, segment)?;
             boosted_reward = boosted_reward
                 .checked_add(segment_reward)
                 .ok_or(VaultError::ArithmeticError)?;
@@ -1238,6 +1557,7 @@ impl VaultContract {
                 amount,
                 rate_bps,
                 current_multiplier,
+                BOOST_BPS_BASE,
                 ledgers - cursor,
             )?;
             boosted_reward = boosted_reward
@@ -1337,6 +1657,7 @@ impl VaultContract {
             events::position_opened(env, staker, amount);
         }
         Self::record_stake_snapshot(env, staker, new_shares);
+        Self::update_leaderboard(env, staker, new_shares);
 
         events::deposit(env, staker, amount, shares);
 
@@ -1460,6 +1781,7 @@ impl VaultContract {
             events::position_closed(env, staker);
         }
         Self::record_stake_snapshot(env, staker, new_user_shares);
+        Self::update_leaderboard(env, staker, new_user_shares);
 
         let token_client = token::Client::new(env, &token_addr);
         token_client.transfer(&env.current_contract_address(), staker, &amount_returned);
@@ -1612,51 +1934,77 @@ impl VaultContract {
             None => return Ok(0),
         };
 
+        // Load campaign once so reward_for_ledgers can split at campaign boundaries (#48)
+        let campaign: Option<CampaignInfo> = env.storage().instance().get(&DataKey::BoostCampaign);
+
         let schedule = balance::get_boost_schedule(env).unwrap_or(Vec::new(env));
         let mut reward: i128 = 0;
         let mut cursor = start_ledger;
-        let mut current_multiplier =
-            Self::multiplier_for_elapsed(schedule.clone(), cursor.saturating_sub(staked_at));
-        let mut index = 0;
+        let mut current_multiplier = BOOST_BPS_BASE;
+        let mut tier_index = 0u32;
 
-        while index < schedule.len() {
-            let (tier_ledger, tier_multiplier) = schedule.get(index).unwrap();
+        // Advance past boost tiers already fully elapsed at start_ledger
+        while tier_index < schedule.len() {
+            let (tier_ledger, tier_mult) = schedule.get(tier_index).unwrap();
             let threshold = staked_at.saturating_add(tier_ledger);
-
             if threshold <= cursor {
-                current_multiplier = tier_multiplier;
-                index += 1;
-                continue;
-            }
-
-            if threshold >= end_ledger {
+                current_multiplier = tier_mult;
+                tier_index += 1;
+            } else {
                 break;
             }
-
-            reward = reward
-                .checked_add(Self::reward_for_ledgers(
-                    current_shares,
-                    rate_bps,
-                    current_multiplier,
-                    threshold - cursor,
-                )?)
-                .ok_or(VaultError::ArithmeticError)?;
-
-            cursor = threshold;
-            current_multiplier = tier_multiplier;
-            index += 1;
         }
 
-        reward = reward
-            .checked_add(Self::reward_for_ledgers(
-                current_shares,
-                rate_bps,
-                current_multiplier,
-                end_ledger - cursor,
-            )?)
-            .ok_or(VaultError::ArithmeticError)?;
+        // Walk segments split by BOTH boost-tier boundaries and campaign boundaries
+        while cursor < end_ledger {
+            let next_tier_boundary = if tier_index < schedule.len() {
+                let (tier_ledger, _) = schedule.get(tier_index).unwrap();
+                staked_at.saturating_add(tier_ledger)
+            } else {
+                u32::MAX
+            };
+
+            let (campaign_mult, next_campaign_boundary) =
+                Self::campaign_info_at(cursor, &campaign);
+
+            let seg_end = next_tier_boundary
+                .min(next_campaign_boundary)
+                .min(end_ledger);
+
+            if seg_end > cursor {
+                reward = reward
+                    .checked_add(Self::reward_for_ledgers(
+                        current_shares,
+                        rate_bps,
+                        current_multiplier,
+                        campaign_mult,
+                        seg_end - cursor,
+                    )?)
+                    .ok_or(VaultError::ArithmeticError)?;
+            }
+
+            cursor = seg_end;
+
+            // Advance tier multiplier when we land exactly on a tier boundary
+            if cursor == next_tier_boundary && tier_index < schedule.len() {
+                let (_, tier_mult) = schedule.get(tier_index).unwrap();
+                current_multiplier = tier_mult;
+                tier_index += 1;
+            }
+        }
 
         Ok(reward)
+    }
+
+    /// Returns `(campaign_multiplier_bps, next_boundary_ledger)` for a given cursor position.
+    ///
+    /// `next_boundary_ledger` is the ledger at which the campaign multiplier changes next.
+    fn campaign_info_at(cursor: u32, campaign: &Option<CampaignInfo>) -> (u32, u32) {
+        match campaign {
+            Some(c) if cursor < c.starts_at_ledger => (BOOST_BPS_BASE, c.starts_at_ledger),
+            Some(c) if cursor < c.ends_at_ledger => (c.multiplier_bps, c.ends_at_ledger),
+            _ => (BOOST_BPS_BASE, u32::MAX),
+        }
     }
 
     /// Normalize a reward computed in stake token precision to reward token
@@ -1688,7 +2036,6 @@ impl VaultContract {
             raw.checked_mul(factor).ok_or(VaultError::ArithmeticError)
         } else {
             let factor = Self::pow10(stake_decimals - reward_decimals)?;
-            // factor is always >= 10, so division is safe.
             Ok(raw / factor)
         }
     }
@@ -1704,24 +2051,34 @@ impl VaultContract {
         Ok(result)
     }
 
+
     fn reward_for_ledgers(
         amount: i128,
         rate_bps: u32,
         multiplier_bps: u32,
+        campaign_multiplier_bps: u32,
         elapsed_ledgers: u32,
     ) -> Result<i128, VaultError> {
         if elapsed_ledgers == 0 || amount == 0 {
             return Ok(0);
         }
 
+        // Apply tier multiplier: effective_rate = rate_bps * tier_mult / 10000
         let effective_rate_bps = (rate_bps as i128)
             .checked_mul(multiplier_bps as i128)
             .ok_or(VaultError::ArithmeticError)?
             .checked_div(BOOST_BPS_BASE as i128)
             .ok_or(VaultError::ArithmeticError)?;
 
+        // Stack campaign multiplier: boosted_rate = effective_rate * campaign_mult / 10000
+        let boosted_rate_bps = effective_rate_bps
+            .checked_mul(campaign_multiplier_bps as i128)
+            .ok_or(VaultError::ArithmeticError)?
+            .checked_div(BOOST_BPS_BASE as i128)
+            .ok_or(VaultError::ArithmeticError)?;
+
         amount
-            .checked_mul(effective_rate_bps)
+            .checked_mul(boosted_rate_bps)
             .ok_or(VaultError::ArithmeticError)?
             .checked_mul(elapsed_ledgers as i128)
             .ok_or(VaultError::ArithmeticError)?
@@ -1759,6 +2116,102 @@ impl VaultContract {
         }
 
         multiplier
+    }
+
+    /// Update the on-chain leaderboard after a stake or unstake operation (#46).
+    ///
+    /// Rebuilds the sorted `Vec<LeaderboardEntry>` (descending by amount) removing the old entry
+    /// for `user` and reinserting at the correct position with their current position size.
+    /// No-op when `LeaderboardSize` is 0 (leaderboard tracking disabled).
+    fn update_leaderboard(env: &Env, user: &Address, new_shares: i128) {
+        let max_size: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LeaderboardSize)
+            .unwrap_or(0);
+        if max_size == 0 {
+            return;
+        }
+
+        let total_shares = balance::get_total_shares(env);
+        let total_deposited = balance::get_total_deposited(env);
+        let new_amount = if new_shares == 0 || total_shares == 0 {
+            0i128
+        } else {
+            balance::shares_to_amount(total_shares, total_deposited, new_shares).unwrap_or(0)
+        };
+
+        let old_board: Vec<LeaderboardEntry> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Leaderboard)
+            .unwrap_or(Vec::new(env));
+
+        // Rebuild board excluding the user's existing entry
+        let mut board: Vec<LeaderboardEntry> = Vec::new(env);
+        let mut i = 0u32;
+        while i < old_board.len() {
+            let entry = old_board.get(i).unwrap();
+            if entry.staker != *user {
+                board.push_back(entry);
+            }
+            i += 1;
+        }
+
+        if new_amount > 0 {
+            let board_len = board.len();
+            // Qualifies if board has room or user beats the last entry
+            let qualifies = (board_len as u32) < max_size || {
+                if board_len > 0 {
+                    new_amount > board.get(board_len - 1).unwrap().amount
+                } else {
+                    true
+                }
+            };
+
+            if qualifies {
+                // Find insertion point (sorted descending by amount)
+                let mut insert_idx = board.len();
+                let mut j = 0u32;
+                while j < board.len() {
+                    if new_amount > board.get(j).unwrap().amount {
+                        insert_idx = j;
+                        break;
+                    }
+                    j += 1;
+                }
+
+                // Rebuild with the new entry inserted at insert_idx
+                let mut final_board: Vec<LeaderboardEntry> = Vec::new(env);
+                let mut k = 0u32;
+                while k < board.len() {
+                    if k == insert_idx {
+                        final_board.push_back(LeaderboardEntry {
+                            staker: user.clone(),
+                            amount: new_amount,
+                        });
+                    }
+                    final_board.push_back(board.get(k).unwrap());
+                    k += 1;
+                }
+                if insert_idx == board.len() {
+                    final_board.push_back(LeaderboardEntry {
+                        staker: user.clone(),
+                        amount: new_amount,
+                    });
+                }
+
+                // Trim to max_size
+                while (final_board.len() as u32) > max_size {
+                    final_board.pop_back();
+                }
+
+                env.storage().instance().set(&DataKey::Leaderboard, &final_board);
+                return;
+            }
+        }
+
+        env.storage().instance().set(&DataKey::Leaderboard, &board);
     }
 
     fn require_not_paused(env: &Env) -> Result<(), VaultError> {

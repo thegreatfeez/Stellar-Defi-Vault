@@ -210,15 +210,26 @@ pub struct ClaimWindow {
     pub window_started_at: u32,
 }
 
+/// Soroban-compatible optional StakePosition.
+///
+/// `Option<ContractType>` cannot appear as a field in another `#[contracttype]`
+/// struct (SDK 21.x limitation). This enum provides the same semantics.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum OptionalPosition {
+    None,
+    Some(StakePosition),
+}
+
 /// Aggregated user state returned by `user_summary` (issue #103).
 ///
-/// - `position`: current stake position, or `None` if user has no stake.
+/// - `position`: current stake position, or `OptionalPosition::None` if no stake.
 /// - `pending_reward`: rewards accrued but not yet claimed.
 /// - `pool_share_bps`: user's share of the total pool in basis points (10000 = 100%).
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct UserSummary {
-    pub position: Option<StakePosition>,
+    pub position: OptionalPosition,
     pub pending_reward: i128,
     pub pool_share_bps: i128,
 }

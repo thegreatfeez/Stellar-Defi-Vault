@@ -77,6 +77,9 @@ pub fn set_rate_history(env: &Env, history: &Vec<(u32, u32)>) {
 
 pub const MAX_RATE_HISTORY_ENTRIES: u32 = 50;
 
+/// Maximum allowed reward rate in basis points (500% APR). Issue #72.
+pub const MAX_RATE_BPS: u32 = 50_000;
+
 pub fn get_reward_pool_balance(env: &Env) -> i128 {
     env.storage()
         .instance()
@@ -401,6 +404,22 @@ pub fn set_reward_remainder(env: &Env, user: &Address, amount: i128) {
     env.storage()
         .persistent()
         .set(&DataKey::RewardRemainder(user.clone()), &amount);
+}
+
+// ── Issue #69: last updated ledger ───────────────────────────────────────────
+// Uses symbol_short! to avoid pushing DataKey over the contracttype variant limit.
+
+pub fn get_last_updated_ledger(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&symbol_short!("lst_upd"))
+        .unwrap_or(0)
+}
+
+pub fn set_last_updated_ledger(env: &Env, ledger: u32) {
+    env.storage()
+        .instance()
+        .set(&symbol_short!("lst_upd"), &ledger);
 }
 
 // ── Issue #97: pool description ──────────────────────────────────────────────

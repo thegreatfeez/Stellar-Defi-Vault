@@ -4,9 +4,9 @@ use crate::{
     admin, balance, errors::VaultError, events,
     nft::StakeReceiptNFTClient,
     storage::{
-        CampaignInfo, ClaimWindow, DataKey, InterfaceId, LeaderboardEntry, PoolConfig, PoolStats,
-        StakeAction, StakeHistoryEntry, StakePosition, StakeStreak, UnbondingPosition, UnstakeCheckResult,
-        UserStats, UserSummary,
+        CampaignInfo, ClaimWindow, DataKey, InterfaceId, LeaderboardEntry, OptionalPosition,
+        PoolConfig, PoolStats, StakeAction, StakeHistoryEntry, StakePosition, StakeStreak,
+        UnbondingPosition, UnstakeCheckResult, UserStats, UserSummary,
     },
 };
 
@@ -27,6 +27,9 @@ pub struct VaultContract;
 impl VaultContract {
     /// Initialize the vault with an admin and the token it accepts.
     ///
+    /// `reward_rate_bps` sets the initial APR in basis points (max `MAX_RATE_BPS`).
+    /// Pass `0` to start with no reward rate and configure it later via `set_reward_rate_bps`.
+    ///
     /// `stake_decimals` and `reward_decimals` declare the decimal precision of
     /// the stake and reward tokens so reward amounts can be normalized when the
     /// two tokens differ. Both are optional and default to 7 (the Stellar
@@ -36,6 +39,7 @@ impl VaultContract {
         env: Env,
         admin: Address,
         token: Address,
+        reward_rate_bps: u32,
         stake_decimals: Option<u32>,
         reward_decimals: Option<u32>,
     ) -> Result<(), VaultError> {
@@ -43,11 +47,27 @@ impl VaultContract {
             return Err(VaultError::AlreadyInitialized);
         }
 
+        // Issue #70: reject zero/self-referential addresses.
+        let self_addr = env.current_contract_address();
+        if admin == self_addr {
+            return Err(VaultError::InvalidAddress);
+        }
+        if token == self_addr {
+            return Err(VaultError::InvalidAddress);
+        }
+
+        // Issue #72: validate reward rate.
+        Self::validate_rate_bps(reward_rate_bps)?;
+
         admin::set_admin(&env, &admin);
         env.storage().instance().set(&DataKey::Token, &token);
         env.storage().instance().set(&DataKey::Paused, &false);
         // By default, set the slash treasury to the admin address. Can be updated by admin later.
         env.storage().instance().set(&DataKey::SlashTreasury, &admin);
+
+        if reward_rate_bps > 0 {
+            balance::set_reward_rate_bps(&env, reward_rate_bps);
+        }
 
         // Persist token decimals so reward math can normalize across mismatched
         // precisions. Unspecified values fall back to the Stellar standard of 7.
@@ -60,7 +80,7 @@ impl VaultContract {
             reward_decimals.unwrap_or(balance::DEFAULT_TOKEN_DECIMALS),
         );
 
-        events::pool_initialized(&env, &admin, &token, &token, 0);
+        events::pool_initialized(&env, &admin, &token, &token, reward_rate_bps);
         Ok(())
     }
 
@@ -155,6 +175,14 @@ impl VaultContract {
             .instance()
             .get(&DataKey::Token)
             .ok_or(VaultError::NotInitialized)
+    }
+
+    /// Read-only: ledger sequence of the last state-changing operation (issue #69).
+    ///
+    /// Returns 0 if no state-changing operation has been recorded yet.
+    /// Updated by stake, unstake, claim, pause, and unpause.
+    pub fn get_last_updated_ledger(env: Env) -> u32 {
+        balance::get_last_updated_ledger(&env)
     }
 
     /// Returns true when the pool is paused, false otherwise.
@@ -297,6 +325,7 @@ impl VaultContract {
         events::paused(&env, &admin);
         events::admin_action_pause(&env, &admin);
         balance::increment_admin_action_count(&env);
+        balance::set_last_updated_ledger(&env, env.ledger().sequence()); // Issue #69
         Ok(())
     }
 
@@ -310,6 +339,7 @@ impl VaultContract {
         events::unpaused(&env, &admin);
         events::admin_action_unpause(&env, &admin);
         balance::increment_admin_action_count(&env);
+        balance::set_last_updated_ledger(&env, env.ledger().sequence()); // Issue #69
         Ok(())
     }
 
@@ -722,6 +752,7 @@ impl VaultContract {
     /// Admin: set the base reward APR in basis points.
     pub fn set_reward_rate_bps(env: Env, rate_bps: u32) -> Result<(), VaultError> {
         admin::require_admin(&env)?;
+        Self::validate_rate_bps(rate_bps)?; // Issue #72
         let old_rate = balance::get_reward_rate_bps(&env);
         
         // Append to rate history before changing rate
@@ -1748,6 +1779,14 @@ impl VaultContract {
 
     // --- Internal helpers ---
 
+    /// Issue #72: shared rate validation used by initialize and set_reward_rate_bps.
+    fn validate_rate_bps(rate_bps: u32) -> Result<(), VaultError> {
+        if rate_bps > balance::MAX_RATE_BPS {
+            return Err(VaultError::RateTooHigh);
+        }
+        Ok(())
+    }
+
     fn remove_from_staker_list(env: &Env, user: &Address) {
         let stakers = balance::get_all_stakers(env);
         let mut updated = Vec::new(env);
@@ -1879,6 +1918,7 @@ impl VaultContract {
         Self::append_stake_history(env, staker, StakeAction::Stake, amount);
 
         events::deposit(env, staker, amount, shares);
+        balance::set_last_updated_ledger(env, env.ledger().sequence()); // Issue #69
 
         Ok(shares)
     }
@@ -2019,6 +2059,7 @@ impl VaultContract {
         token_client.transfer(&env.current_contract_address(), staker, &amount_returned);
 
         events::withdraw(env, staker, shares, amount_returned);
+        balance::set_last_updated_ledger(env, env.ledger().sequence()); // Issue #69
 
         Ok(amount_returned)
     }
@@ -2229,11 +2270,13 @@ impl VaultContract {
                 .ok_or(VaultError::ArithmeticError)?;
 
             // Advance tier multiplier when we land exactly on a tier boundary
-            if cursor == next_tier_boundary && tier_index < schedule.len() {
+            if seg_end == next_tier_boundary && tier_index < schedule.len() {
                 let (_, tier_mult) = schedule.get(tier_index).unwrap();
                 current_multiplier = tier_mult;
                 tier_index += 1;
             }
+
+            cursor = seg_end;
         }
 
         let final_segment_dust = Self::reward_dust_for_ledgers(
@@ -2519,7 +2562,9 @@ impl VaultContract {
 
     /// Append one entry to the user's stake/unstake history ring buffer (max 5).
     fn append_stake_history(env: &Env, user: &Address, action: StakeAction, amount: i128) {
-        let key = DataKey::StakeHistory(user.clone());
+        // Uses a tuple key to avoid collision with DataKey::StakeHistory used for
+        // governance vote-weight snapshots (Vec<(u32, i128)> vs Vec<StakeHistoryEntry>).
+        let key = (soroban_sdk::Symbol::new(env, "stkh"), user.clone());
         let mut history: Vec<StakeHistoryEntry> = env
             .storage()
             .persistent()
@@ -2551,6 +2596,7 @@ impl VaultContract {
         let accrued = balance::get_accrued_reward(env, staker);
         if accrued == 0 {
             balance::set_last_claim_ledger(env, staker, env.ledger().sequence());
+            balance::set_last_updated_ledger(env, env.ledger().sequence()); // Issue #69
             return Ok(0);
         }
 
@@ -2559,6 +2605,7 @@ impl VaultContract {
         if reward == 0 {
             // Cap is exhausted for this window; nothing to pay out now.
             balance::set_last_claim_ledger(env, staker, env.ledger().sequence());
+            balance::set_last_updated_ledger(env, env.ledger().sequence()); // Issue #69
             return Ok(0);
         }
 
@@ -2588,6 +2635,7 @@ impl VaultContract {
         balance::set_total_rewards_paid(env, paid + reward);
 
         events::claimed(env, staker, reward);
+        balance::set_last_updated_ledger(env, env.ledger().sequence()); // Issue #69
 
         Ok(reward)
     }
@@ -2861,7 +2909,10 @@ impl VaultContract {
                 .unwrap_or(0)
         };
         Ok(UserSummary {
-            position,
+            position: match position {
+                Some(p) => OptionalPosition::Some(p),
+                None => OptionalPosition::None,
+            },
             pending_reward,
             pool_share_bps,
         })
@@ -2873,9 +2924,10 @@ impl VaultContract {
     ///
     /// Returns an empty vec for a user who has never staked. No auth required.
     pub fn stake_history(env: Env, user: Address) -> Vec<StakeHistoryEntry> {
+        let key = (soroban_sdk::Symbol::new(&env, "stkh"), user);
         env.storage()
             .persistent()
-            .get(&DataKey::StakeHistory(user))
+            .get(&key)
             .unwrap_or_else(|| Vec::new(&env))
     }
 

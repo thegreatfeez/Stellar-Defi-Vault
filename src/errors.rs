@@ -55,4 +55,8 @@ pub enum VaultError {
     NonMonotonicWaveId = 33,
     /// record_wave_activity was called with more than 50 active users (issue #99).
     TooManyActiveUsers = 34,
+    /// admin, stake_token, or reward_token is the zero/invalid address (issue #70).
+    InvalidAddress = 35,
+    /// reward_rate_bps exceeds the maximum allowed cap (issue #72).
+    RateTooHigh = 36,
 }
